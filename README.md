@@ -33,7 +33,7 @@
 - 👁️ **自动处理图片请求 (Vision Translation)**：
   如果客户端发送了携带图片的请求，但当前节点不支持视觉能力（如纯文本模型），系统会自动调用支持视觉的模型（如 GPT-4o, GLM-4V）进行图像解析。解析出的文字描述将自动追加到上下文中，供纯文本模型继续处理。控制台列表支持通过 UI 徽章直观显示节点的视觉支持状态。
 - 🔌 **多协议兼容**：
-  支持 OpenAI 协议与 Anthropic (Claude) 协议。无论后台使用什么模型，对外均提供标准的 OpenAI 接口格式。
+  支持 OpenAI 协议、Anthropic (Claude) 协议、原生 OpenAI Responses 上游协议，并提供入站 Responses API（`/v1/responses`）。支持 function call、`store` / `previous_response_id` 持久化会话记忆、结构化输出和 `reasoning` 参数透传。无论后台使用什么模型，对外均提供标准的 OpenAI 接口格式。
 - 📊 **统计大盘 (Data Analytics)**：
   提供类似玻璃拟物化 (Glassmorphism) 风格的统计面板。基于底层 SQLite 数据库持久化，记录 Token 的消耗情况（缓存命中、生成、流失）。
 - 💬 **日志追踪 (Audit Logs)**：
@@ -62,6 +62,16 @@ python api_pool_server.py
 👉 **[http://localhost:5100](http://localhost:5100)**
 
 *(默认对外 API 接口 Base URL 为 `http://localhost:5100/v1`，API Key 可任意填写)*
+
+---
+
+## 🧪 测试
+
+```bash
+python tests\test_responses_api.py
+```
+
+测试报告见 [RESPONSES_API_TEST_REPORT.md](RESPONSES_API_TEST_REPORT.md)。
 
 ---
 
@@ -97,6 +107,7 @@ graph TD
 | **POST** | `/api/test-pool` | 测试聚合池整体可用性 |
 | **POST** | `/api/test` | 测试指定的单一端点 |
 | **POST** | `/api/health-check` | 触发一次全局健康检查 |
+| **POST** | `/v1/responses` | Responses API 入站适配（支持流式） |
 | **GET** | `/api/token-stats` | 获取数据统计概览 |
 | **GET** | `/api/chat-logs` | 获取最新的对话与请求日志 |
 | **DELETE**| `/api/logs` / `/api/token-stats` | 清空对应的数据记录 |

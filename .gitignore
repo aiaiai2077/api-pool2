@@ -13,6 +13,8 @@ token_stats.db
 token_stats.db-journal
 chat_logs.db
 chat_logs.db-journal
+responses_store.db
+responses_store.db-journal
 
 # 临时脚本
 test_suite.py

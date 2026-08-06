@@ -332,6 +332,982 @@ def extract_prompt_text(payload):
     except Exception:
         return str(payload)[:2000]
 
+
+# ============================================================
+#  Responses API (inbound adapter)
+# ============================================================
+
+def _responses_instructions_text(instructions):
+    if isinstance(instructions, str):
+        return instructions
+    if isinstance(instructions, list):
+        texts = []
+        for item in instructions:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict) and item.get("type") in ("input_text", "text", "output_text"):
+                texts.append(item.get("text", ""))
+        return "\n".join(t for t in texts if t)
+    return str(instructions or "")
+
+
+def _responses_content_to_chat(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, str):
+                parts.append({"type": "text", "text": c})
+                continue
+            if not isinstance(c, dict):
+                continue
+            ctype = c.get("type")
+            if ctype in ("input_text", "output_text", "text"):
+                parts.append({"type": "text", "text": c.get("text", "")})
+            elif ctype in ("input_image", "image_url"):
+                raw_url = c.get("image_url")
+                if isinstance(raw_url, dict):
+                    url = raw_url.get("url", "")
+                    detail = c.get("detail") or raw_url.get("detail")
+                else:
+                    url = raw_url or ""
+                    detail = c.get("detail")
+                image = {"url": url}
+                if detail:
+                    image["detail"] = detail
+                parts.append({"type": "image_url", "image_url": image})
+        if not parts:
+            return ""
+        if len(parts) == 1 and parts[0]["type"] == "text":
+            return parts[0]["text"]
+        return parts
+    return str(content)
+
+
+def _responses_content_text(content):
+    if isinstance(content, str):
+        return content
+    texts = []
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, str):
+                texts.append(c)
+            elif isinstance(c, dict):
+                ctype = c.get("type")
+                if ctype in ("input_text", "output_text", "text"):
+                    texts.append(c.get("text", ""))
+    return "\n".join(t for t in texts if t)
+
+
+def _responses_input_to_messages(input_data, instructions):
+    messages = []
+    if instructions:
+        instr_text = _responses_instructions_text(instructions)
+        if instr_text:
+            messages.append({"role": "system", "content": instr_text})
+
+    if isinstance(input_data, str):
+        messages.append({"role": "user", "content": input_data})
+        return messages
+    if not isinstance(input_data, list):
+        raise ValueError("input must be a string or an array of input items")
+
+    user_parts = []
+
+    def flush_user_parts():
+        nonlocal user_parts
+        if user_parts:
+            messages.append({"role": "user", "content": user_parts})
+            user_parts = []
+
+    for item in input_data:
+        if isinstance(item, str):
+            user_parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in ("input_text", "text"):
+            user_parts.append({"type": "text", "text": item.get("text", "")})
+        elif item_type in ("input_image", "image_url"):
+            raw_url = item.get("image_url")
+            if isinstance(raw_url, dict):
+                url = raw_url.get("url", "")
+                detail = item.get("detail") or raw_url.get("detail")
+            else:
+                url = raw_url or ""
+                detail = item.get("detail")
+            image = {"url": url}
+            if detail:
+                image["detail"] = detail
+            user_parts.append({"type": "image_url", "image_url": image})
+        elif item_type == "message":
+            role = item.get("role", "user")
+            content = _responses_content_to_chat(item.get("content"))
+            if role in ("system", "developer"):
+                text = content if isinstance(content, str) else _responses_content_text(content)
+                if text:
+                    messages.append({"role": "system", "content": text})
+            else:
+                safe_role = role if role in ("user", "assistant", "tool") else "user"
+                messages.append({"role": safe_role, "content": content or ""})
+        elif item_type == "function_call":
+            flush_user_parts()
+            fn = item.get("function") or {}
+            tool_call = {
+                "id": item.get("call_id", ""),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", "") or fn.get("name", ""),
+                    "arguments": item.get("arguments", "") or fn.get("arguments", "")
+                }
+            }
+            if messages and messages[-1].get("role") == "assistant":
+                messages[-1].setdefault("tool_calls", []).append(tool_call)
+            else:
+                messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
+        elif item_type == "function_call_output":
+            flush_user_parts()
+            call_id = item.get("call_id", "")
+            output = item.get("output", "")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": str(output)
+            })
+
+    if user_parts:
+        messages.append({"role": "user", "content": user_parts})
+    if not messages:
+        raise ValueError("input is empty or contains no supported items")
+    return messages
+
+
+def _responses_tools_to_chat(tools):
+    if not isinstance(tools, list):
+        return []
+    chat_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        chat_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}}
+            }
+        })
+    return chat_tools
+
+
+def _responses_tool_choice_to_chat(tool_choice):
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        name = tool_choice.get("name")
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return None
+
+
+def _responses_text_format_to_chat(text_param):
+    if not isinstance(text_param, dict):
+        return None
+    fmt = text_param.get("format")
+    if isinstance(fmt, str):
+        return {"type": fmt} if fmt in ("text", "json_object") else None
+    if not isinstance(fmt, dict):
+        return None
+    fmt_type = fmt.get("type")
+    if fmt_type == "json_schema":
+        json_schema = fmt.get("json_schema")
+        if not isinstance(json_schema, dict):
+            json_schema = fmt
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": json_schema.get("name") or "response",
+                "schema": json_schema.get("schema") or {},
+                "strict": bool(json_schema.get("strict", False))
+            }
+        }
+    if fmt_type in ("text", "json_object"):
+        return {"type": fmt_type}
+    return None
+
+
+def _chat_response_format_to_responses_text(response_format):
+    if not isinstance(response_format, dict):
+        return None
+    fmt_type = response_format.get("type")
+    if fmt_type == "json_schema":
+        json_schema = response_format.get("json_schema") or {}
+        return {
+            "format": {
+                "type": "json_schema",
+                "name": json_schema.get("name") or "response",
+                "schema": json_schema.get("schema") or {},
+                "strict": bool(json_schema.get("strict", False))
+            }
+        }
+    if fmt_type in ("text", "json_object"):
+        return {"format": {"type": fmt_type}}
+    return None
+
+
+def _responses_to_chat_request(body):
+    input_data = body.get("input")
+    if input_data is None:
+        raise ValueError("input is required")
+    messages = _responses_input_to_messages(input_data, body.get("instructions"))
+
+    extra = {}
+    for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty",
+                "seed", "user", "metadata", "logprobs", "top_logprobs"):
+        if key in body:
+            extra[key] = body[key]
+    if "max_output_tokens" in body:
+        extra["max_tokens"] = body["max_output_tokens"]
+    if "max_completion_tokens" in body:
+        extra["max_tokens"] = body["max_completion_tokens"]
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        extra["reasoning_effort"] = reasoning["effort"]
+    response_format = _responses_text_format_to_chat(body.get("text"))
+    if response_format:
+        extra["response_format"] = response_format
+
+    tools = _responses_tools_to_chat(body.get("tools"))
+    if tools:
+        extra["tools"] = tools
+        if "parallel_tool_calls" in body:
+            extra["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
+        tool_choice = _responses_tool_choice_to_chat(body.get("tool_choice"))
+        if tool_choice is not None:
+            extra["tool_choice"] = tool_choice
+    return messages, extra
+
+
+def _responses_default_usage():
+    return {
+        "input_tokens": 0,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 0,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 0
+    }
+
+
+def _responses_usage_from_chat_usage(usage):
+    if not usage:
+        return _responses_default_usage()
+    reasoning_tokens = 0
+    if isinstance(usage.get("completion_tokens_details"), dict):
+        reasoning_tokens = usage["completion_tokens_details"].get("reasoning_tokens", 0) or 0
+    cached_tokens = 0
+    if isinstance(usage.get("prompt_tokens_details"), dict):
+        cached_tokens = usage["prompt_tokens_details"].get("cached_tokens", 0) or 0
+    return {
+        "input_tokens": usage.get("prompt_tokens", 0) or 0,
+        "input_tokens_details": {"cached_tokens": cached_tokens},
+        "output_tokens": usage.get("completion_tokens", 0) or 0,
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        "total_tokens": usage.get("total_tokens", 0) or 0
+    }
+
+
+def _chat_content_to_responses_content(content):
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    parts = []
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        ctype = c.get("type")
+        if ctype == "text":
+            parts.append({"type": "input_text", "text": c.get("text", "")})
+        elif ctype == "image_url":
+            raw_url = c.get("image_url") or {}
+            if isinstance(raw_url, dict):
+                url = raw_url.get("url", "")
+                detail = c.get("detail") or raw_url.get("detail")
+            else:
+                url = raw_url or ""
+                detail = c.get("detail")
+            image = {"url": url}
+            if detail:
+                image["detail"] = detail
+            parts.append({"type": "input_image", "image_url": image})
+    return parts
+
+
+def _chat_messages_to_responses_input(messages):
+    instructions = []
+    items = []
+    for m in messages or []:
+        role = m.get("role")
+        if role == "system":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+            if content:
+                instructions.append(content)
+            continue
+        if role == "assistant":
+            content = m.get("content") or ""
+            if content:
+                items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": _chat_content_to_responses_content(content)
+                })
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "") or ""
+                })
+        elif role == "tool":
+            output = m.get("content", "")
+            if isinstance(output, list):
+                output = "".join(p.get("text", "") for p in output if isinstance(p, dict) and p.get("type") == "text")
+            items.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id", ""),
+                "output": output or ""
+            })
+        else:
+            items.append({
+                "type": "message",
+                "role": "user",
+                "content": _chat_content_to_responses_content(m.get("content", ""))
+            })
+    return items, "\n".join(i for i in instructions if i).strip()
+
+
+def _responses_tools_from_chat(tools):
+    if not isinstance(tools, list):
+        return []
+    responses_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function") or {}
+        responses_tools.append({
+            "type": "function",
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}}
+        })
+    return responses_tools
+
+
+def _responses_body_from_chat(payload):
+    items, instructions = _chat_messages_to_responses_input(payload.get("messages", []))
+    body = {
+        "model": payload.get("model", ""),
+        "input": items or "",
+    }
+    if instructions:
+        body["instructions"] = instructions
+    if "max_tokens" in payload:
+        body["max_output_tokens"] = payload["max_tokens"]
+    for key in ("stream", "temperature", "top_p", "user", "metadata",
+                "parallel_tool_calls", "store", "reasoning", "previous_response_id"):
+        if key in payload:
+            body[key] = payload[key]
+    if "reasoning" not in body and "reasoning_effort" in payload:
+        body["reasoning"] = {"effort": payload["reasoning_effort"]}
+    if "response_format" in payload:
+        text = _chat_response_format_to_responses_text(payload["response_format"])
+        if text:
+            body["text"] = text
+    tools = _responses_tools_from_chat(payload.get("tools"))
+    if tools:
+        body["tools"] = tools
+        tool_choice = payload.get("tool_choice")
+        if tool_choice is not None:
+            if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+                body["tool_choice"] = {
+                    "type": "function",
+                    "name": tool_choice.get("function", {}).get("name", "")
+                }
+            else:
+                body["tool_choice"] = tool_choice
+    return body
+
+
+def _responses_output_to_chat_message(output):
+    text = ""
+    tool_calls = []
+    for item in output or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text += part.get("text", "")
+        elif item.get("type") == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id", ""),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "") or ""
+                }
+            })
+    return text, tool_calls
+
+
+def _responses_usage_to_chat_usage(usage):
+    if not usage:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0}
+        }
+    input_details = usage.get("input_tokens_details") or {}
+    output_details = usage.get("output_tokens_details") or {}
+    return {
+        "prompt_tokens": usage.get("input_tokens", 0) or 0,
+        "completion_tokens": usage.get("output_tokens", 0) or 0,
+        "total_tokens": usage.get("total_tokens", 0) or 0,
+        "prompt_tokens_details": {"cached_tokens": input_details.get("cached_tokens", 0) or 0},
+        "completion_tokens_details": {"reasoning_tokens": output_details.get("reasoning_tokens", 0) or 0}
+    }
+
+
+RESPONSES_DB = "responses_store.db"
+RESPONSES_STORE_LOCK = threading.Lock()
+RESPONSES_STORE_MAX = 200
+
+
+def _responses_store_init():
+    with sqlite3.connect(RESPONSES_DB, timeout=5) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS responses_store (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+def _responses_store_put(response_id, data):
+    with RESPONSES_STORE_LOCK:
+        with sqlite3.connect(RESPONSES_DB, timeout=5) as conn:
+            conn.execute(
+                """
+                INSERT INTO responses_store (id, data, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET data = excluded.data, created_at = excluded.created_at
+                """,
+                (response_id, json.dumps(data, ensure_ascii=False), time.time())
+            )
+            conn.execute(
+                """
+                DELETE FROM responses_store
+                WHERE id NOT IN (
+                    SELECT id FROM responses_store ORDER BY created_at DESC LIMIT ?
+                )
+                """,
+                (RESPONSES_STORE_MAX,)
+            )
+            conn.commit()
+
+
+def _responses_store_get(response_id):
+    with RESPONSES_STORE_LOCK:
+        with sqlite3.connect(RESPONSES_DB, timeout=5) as conn:
+            cursor = conn.execute(
+                "SELECT data FROM responses_store WHERE id = ?",
+                (response_id,)
+            )
+            row = cursor.fetchone()
+            return json.loads(row[0]) if row else None
+
+
+def _responses_store_delete(response_id):
+    with RESPONSES_STORE_LOCK:
+        with sqlite3.connect(RESPONSES_DB, timeout=5) as conn:
+            cursor = conn.execute(
+                "DELETE FROM responses_store WHERE id = ?",
+                (response_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+
+_responses_store_init()
+
+
+def _responses_function_call_item(tool_call, idx):
+    fn = tool_call.get("function") or {}
+    call_id = tool_call.get("id") or f"call_{int(time.time() * 1000)}_{idx}"
+    return {
+        "id": f"fc_{int(time.time() * 1000)}_{idx}",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": call_id,
+        "name": fn.get("name", ""),
+        "arguments": fn.get("arguments", "") or "",
+        "output": None
+    }
+
+
+def _responses_response_object(body, text, usage=None, model="api-pool-aggregated",
+                               status="completed", response_id=None, item_id=None,
+                               message=None, output=None):
+    now = int(time.time())
+    rid = response_id or f"resp_{int(time.time() * 1000)}"
+    mid = item_id or f"msg_{int(time.time() * 1000)}"
+    text_value = text if isinstance(text, str) else str(text or "")
+    item = {
+        "id": mid,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text_value, "annotations": []}]
+    }
+    if output is not None:
+        output_items = output
+    else:
+        msg = message or {}
+        tool_calls = msg.get("tool_calls") or []
+        output_items = []
+        if text_value or not tool_calls:
+            output_items.append(item)
+        for idx, tool_call in enumerate(tool_calls):
+            output_items.append(_responses_function_call_item(tool_call, idx))
+    text_param = body.get("text")
+    if isinstance(text_param, dict):
+        text_format = text_param.get("format")
+        if not isinstance(text_format, dict):
+            text_format = {"type": "text"}
+    else:
+        text_format = {"type": "text"}
+    reasoning_param = body.get("reasoning")
+    reasoning_effort = reasoning_param.get("effort") if isinstance(reasoning_param, dict) else None
+    return {
+        "id": rid,
+        "object": "response",
+        "created_at": now,
+        "status": status,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": body.get("instructions"),
+        "max_output_tokens": body.get("max_output_tokens"),
+        "model": model,
+        "parallel_tool_calls": body.get("parallel_tool_calls", True),
+        "previous_response_id": body.get("previous_response_id"),
+        "reasoning": {"effort": reasoning_effort, "summary": None},
+        "store": bool(body.get("store", False)),
+        "temperature": body.get("temperature", 0.7),
+        "text": {"format": text_format},
+        "tool_choice": body.get("tool_choice", "auto"),
+        "tools": body.get("tools", []),
+        "top_p": body.get("top_p", 1),
+        "truncation": body.get("truncation", "disabled"),
+        "usage": usage or _responses_default_usage(),
+        "user": body.get("user"),
+        "metadata": body.get("metadata") or {},
+        "expires_at": None,
+        "output": output_items
+    }
+
+
+def _responses_sse(event_type, data):
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
+
+
+def _parse_chat_completion_chunk(chunk):
+    if not chunk:
+        return None
+    raw = chunk.decode("utf-8", errors="ignore")
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            return None
+        try:
+            return json.loads(payload)
+        except Exception:
+            pass
+    return None
+
+
+def _responses_stream_generator(upstream_gen, body, meta=None, model="api-pool-aggregated",
+                                response_id=None, item_id=None, on_complete=None):
+    response_id = response_id or f"resp_{int(time.time() * 1000)}"
+    item_id = item_id or f"msg_{int(time.time() * 1000)}"
+    output_index = 0
+    content_index = 0
+    final_text = ""
+    final_usage = None
+    tool_states = {}
+    next_output_index = 1
+    seq = 0
+
+    def emit(event_type, data):
+        nonlocal seq
+        seq += 1
+        payload = {"sequence_number": seq, "response_id": response_id}
+        payload.update(data)
+        return _responses_sse(event_type, payload)
+
+    base_response = _responses_response_object(body, "", status="in_progress",
+                                               response_id=response_id, item_id=item_id,
+                                               model=model)
+    base_item = base_response["output"][0]
+    base_part = base_item["content"][0]
+    output_items = [base_item]
+
+    yield emit("response.created", {"type": "response.created", "response": base_response})
+    yield emit("response.in_progress", {"type": "response.in_progress", "response": base_response})
+    yield emit("response.output_item.added", {
+        "type": "response.output_item.added",
+        "output_index": output_index,
+        "item": base_item
+    })
+    yield emit("response.content_part.added", {
+        "type": "response.content_part.added",
+        "item_id": item_id,
+        "output_index": output_index,
+        "content_index": content_index,
+        "part": base_part
+    })
+
+    try:
+        for chunk in upstream_gen:
+            parsed = _parse_chat_completion_chunk(chunk)
+            if not parsed:
+                continue
+            choices = parsed.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                text_delta = delta.get("content")
+                if text_delta:
+                    final_text += text_delta
+                    yield emit("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "delta": text_delta
+                    })
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", len(tool_states))
+                    state = tool_states.get(idx)
+                    if state is None:
+                        call_id = tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}"
+                        fc_id = f"fc_{int(time.time() * 1000)}_{idx}"
+                        name = (tc.get("function") or {}).get("name", "")
+                        state = {
+                            "item_id": fc_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": "",
+                            "output_index": next_output_index,
+                            "item": {
+                                "id": fc_id,
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": "",
+                                "output": None
+                            }
+                        }
+                        tool_states[idx] = state
+                        output_items.append(state["item"])
+                        next_output_index += 1
+                        yield emit("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": state["output_index"],
+                            "item": state["item"]
+                        })
+                    if tc.get("id"):
+                        state["call_id"] = tc["id"]
+                        state["item"]["call_id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        state["name"] = fn["name"]
+                        state["item"]["name"] = fn["name"]
+                    arg_delta = fn.get("arguments") or ""
+                    if arg_delta:
+                        state["arguments"] += arg_delta
+                        state["item"]["arguments"] = state["arguments"]
+                        yield emit("response.function_call_arguments.delta", {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": state["item_id"],
+                            "output_index": state["output_index"],
+                            "delta": arg_delta
+                        })
+            if parsed.get("usage"):
+                final_usage = parsed["usage"]
+
+        meta_message = (meta or {}).get("message") or {}
+        for idx, tc in enumerate((meta_message.get("tool_calls") or [])):
+            fn = tc.get("function") or {}
+            arguments = fn.get("arguments", "") or ""
+            call_id = tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}"
+            existing = [s for s in tool_states.values()]
+            if idx in tool_states:
+                match = tool_states[idx]
+            elif call_id:
+                match = next((s for s in existing if s["call_id"] == call_id), None)
+            else:
+                match = next(
+                    (s for s in existing if s["name"] == fn.get("name") and not s["call_id"]),
+                    None
+                )
+            if match is not None:
+                if arguments and not match["arguments"]:
+                    match["arguments"] = arguments
+                    match["item"]["arguments"] = arguments
+                    yield emit("response.function_call_arguments.delta", {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": match["item_id"],
+                        "output_index": match["output_index"],
+                        "delta": arguments
+                    })
+                continue
+            fc_id = f"fc_{int(time.time() * 1000)}_{idx}"
+            state = {
+                "item_id": fc_id,
+                "call_id": call_id,
+                "name": fn.get("name", ""),
+                "arguments": arguments,
+                "output_index": next_output_index,
+                "item": {
+                    "id": fc_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": fn.get("name", ""),
+                    "arguments": arguments,
+                    "output": None
+                }
+            }
+            tool_states[idx] = state
+            output_items.append(state["item"])
+            next_output_index += 1
+            yield emit("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": state["output_index"],
+                "item": state["item"]
+            })
+            if arguments:
+                yield emit("response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": state["item_id"],
+                    "output_index": state["output_index"],
+                    "delta": arguments
+                })
+
+        yield emit("response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "text": final_text
+        })
+        done_part = {"type": "output_text", "text": final_text, "annotations": []}
+        yield emit("response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": done_part
+        })
+        done_item = {
+            "id": item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [done_part]
+        }
+        yield emit("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": done_item
+        })
+        completed_output = [done_item]
+        for idx in sorted(tool_states, key=lambda i: tool_states[i]["output_index"]):
+            state = tool_states[idx]
+            yield emit("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": state["item_id"],
+                "output_index": state["output_index"],
+                "name": state["name"],
+                "arguments": state["arguments"]
+            })
+            done_call = {
+                "id": state["item_id"],
+                "type": "function_call",
+                "status": "completed",
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "arguments": state["arguments"],
+                "output": None
+            }
+            completed_output.append(done_call)
+            yield emit("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": state["output_index"],
+                "item": done_call
+            })
+        if final_usage is None and (meta or {}).get("usage"):
+            final_usage = meta["usage"]
+        completed_response = _responses_response_object(
+            body, final_text,
+            usage=_responses_usage_from_chat_usage(final_usage),
+            status="completed",
+            response_id=response_id,
+            item_id=item_id,
+            model=model,
+            output=completed_output
+        )
+        yield emit("response.completed", {
+            "type": "response.completed",
+            "response": completed_response
+        })
+        yield b"data: [DONE]\n\n"
+        if on_complete:
+            on_complete(completed_response)
+    except Exception as e:
+        error_obj = {"message": str(e), "type": "server_error", "param": None, "code": None}
+        failed_response = _responses_response_object(
+            body, final_text,
+            usage=_responses_usage_from_chat_usage(final_usage),
+            status="failed",
+            response_id=response_id,
+            item_id=item_id,
+            model=model,
+            output=output_items
+        )
+        failed_response["error"] = error_obj
+        yield emit("response.failed", {
+            "type": "response.failed",
+            "response": failed_response
+        })
+        yield b"data: [DONE]\n\n"
+
+
+def _anthropic_text_from_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "text"
+        )
+    return str(content or "")
+
+
+def _anthropic_user_content_blocks(content):
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    blocks = []
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        ctype = c.get("type")
+        if ctype == "text":
+            blocks.append({"type": "text", "text": c.get("text", "")})
+        elif ctype == "image_url":
+            raw_url = c.get("image_url")
+            if isinstance(raw_url, dict):
+                url = raw_url.get("url", "")
+            else:
+                url = raw_url or ""
+            if url.startswith("data:image/"):
+                try:
+                    media_type = url.split(";", 1)[0].replace("data:", "")
+                    b64_data = url.split(",", 1)[1]
+                    blocks.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": b64_data}
+                    })
+                except Exception:
+                    pass
+            else:
+                blocks.append({"type": "text", "text": f"[Image URL: {url}]"})
+    return blocks or [{"type": "text", "text": ""}]
+
+
+def _anthropic_assistant_content_blocks(message):
+    content = message.get("content") or ""
+    blocks = [
+        block for block in _anthropic_user_content_blocks(content)
+        if not (block.get("type") == "text" and not block.get("text"))
+    ]
+    for tool_call in message.get("tool_calls") or []:
+        fn = tool_call.get("function") or {}
+        arguments = fn.get("arguments", "") or ""
+        try:
+            input_obj = json.loads(arguments) if arguments else {}
+        except Exception:
+            input_obj = {"raw": arguments} if arguments else {}
+        blocks.append({
+            "type": "tool_use",
+            "id": tool_call.get("id", ""),
+            "name": fn.get("name", ""),
+            "input": input_obj
+        })
+    return blocks
+
+
+def _anthropic_append_message(messages, role, blocks):
+    if messages and messages[-1]["role"] == role and isinstance(messages[-1]["content"], list):
+        messages[-1]["content"].extend(blocks)
+    else:
+        messages.append({"role": role, "content": blocks})
+
+
+def _anthropic_tools_from_chat(tools):
+    if not isinstance(tools, list):
+        return []
+    anthropic_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function") or {}
+        anthropic_tools.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}}
+        })
+    return anthropic_tools
+
+
+def _anthropic_tool_choice_from_chat(tool_choice):
+    if isinstance(tool_choice, str):
+        if tool_choice in ("required", "any"):
+            return {"type": "any"}
+        return {"type": tool_choice if tool_choice in ("auto", "none") else "auto"}
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        fn = tool_choice.get("function") or {}
+        name = fn.get("name") or tool_choice.get("name")
+        if name:
+            return {"type": "tool", "name": name}
+    return None
+
+
 # ============================================================
 #  数据结构
 # ============================================================
@@ -531,7 +1507,7 @@ class APIPool:
         
         # Attempt 1
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+        reply, err, _ = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None and latency <= LATENCY_OK_MAX:
@@ -545,7 +1521,7 @@ class APIPool:
             
         # Attempt 2 (Retry for cold start or transient glitch)
         t1 = time.time()
-        reply2, err2 = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+        reply2, err2, _ = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
         latency2 = int((time.time() - t1) * 1000)
         
         if reply2 is not None and latency2 <= LATENCY_OK_MAX:
@@ -595,7 +1571,7 @@ class APIPool:
         for v_ep in vision_eps:
             sys_log(f"启动图片解析 -> 尝试端点 {v_ep.name} ({v_ep.model})", "INFO")
             payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
-            result, error = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True)
+            result, error, _ = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True)
             if error:
                 sys_log(f"图片解析失败 ({v_ep.name} - {v_ep.model}): {error}", "WARNING")
                 continue
@@ -725,7 +1701,7 @@ class APIPool:
                 self._current_idx = i
                 return
 
-    def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
+    def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False, return_meta=False):
         active = self._active_endpoints()
         if not active:
             raise ValueError("没有可用的 API 端点")
@@ -750,20 +1726,28 @@ class APIPool:
                 has_vision = any(getattr(e, "is_vision", True) for e in active)
                 if has_vision:
                     if payload.get("stream"):
+                        meta = {}
+
                         def vision_wrapper(tgt_ep, pld, t_out, a_eps):
                             import json
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
+                            yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             translated_msgs = self._translate_images_sync(pld["messages"], a_eps)
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
+                            yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             pld["messages"] = translated_msgs
-                            gen, err = self._try_endpoint(tgt_ep, pld, t_out)
+                            gen, err, inner_meta = self._try_endpoint(tgt_ep, pld, t_out)
                             if err:
-                                yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"')
+                                yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             else:
                                 yield from gen
+                            meta["usage"] = inner_meta.get("usage")
+                            meta["message"] = inner_meta.get("message")
                         with self._lock:
                             self._on_success(ep)
-                        return vision_wrapper(ep, payload, ep_timeout, active)
+                        wrapper = vision_wrapper(ep, payload, ep_timeout, active)
+                        if return_endpoint:
+                            if return_meta: return wrapper, ep, meta
+                            return wrapper, ep
+                        return wrapper
                     else:
                         payload["messages"] = self._translate_images_sync(payload["messages"], active)
             
@@ -772,12 +1756,14 @@ class APIPool:
             else:
                 sys_log(f"重试请求，尝试端点 '{ep.name}' (模型: {ep_model})", "INFO")
 
-            result, error = self._try_endpoint(ep, payload, ep_timeout)
+            result, error, meta = self._try_endpoint(ep, payload, ep_timeout)
             if result is not None:
                 with self._lock:
                     self._on_success(ep)
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
-                if return_endpoint: return result, ep
+                if return_endpoint:
+                    if return_meta: return result, ep, meta
+                    return result, ep
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
@@ -804,55 +1790,71 @@ class APIPool:
     def _try_endpoint(self, ep, payload, timeout, log_usage=True, force_no_retry=False):
         req_t0 = time.time()
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
+        meta = {"usage": None, "message": None}
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
+        is_responses = (getattr(ep, "protocol", "openai") == "responses")
         
-        if is_anthropic:
-            url = ep.base_url.rstrip("/") + "/messages"
+        if is_responses:
+            url = ep.base_url.rstrip("/") + "/responses"
+            data = json.dumps(_responses_body_from_chat(payload)).encode("utf-8")
+        elif is_anthropic:
+            base = ep.base_url.rstrip("/")
+            if "api.anthropic.com" in base and not base.endswith("/v1"):
+                url = base + "/v1/messages"
+            else:
+                url = base + "/messages"
             anthropic_payload = {
                 "model": payload.get("model", ep.model),
                 "max_tokens": payload.get("max_tokens", 4096),
             }
             if "temperature" in payload: anthropic_payload["temperature"] = payload["temperature"]
             if "top_p" in payload: anthropic_payload["top_p"] = payload["top_p"]
+            if "top_k" in payload: anthropic_payload["top_k"] = payload["top_k"]
             if "stream" in payload: anthropic_payload["stream"] = payload["stream"]
             
             sys_prompt = ""
             messages = []
             for m in payload.get("messages", []):
-                if m.get("role") == "system":
-                    sys_prompt += m.get("content", "") + "\n"
+                role = m.get("role")
+                if role == "system":
+                    sys_prompt += _anthropic_text_from_content(m.get("content")) + "\n"
+                elif role == "assistant":
+                    _anthropic_append_message(
+                        messages, "assistant", _anthropic_assistant_content_blocks(m)
+                    )
+                elif role == "tool":
+                    output = _anthropic_text_from_content(m.get("content"))
+                    _anthropic_append_message(messages, "user", [{
+                        "type": "tool_result",
+                        "tool_use_id": m.get("tool_call_id", ""),
+                        "content": output
+                    }])
                 else:
-                    role = m.get("role")
-                    content = m.get("content")
-                    if isinstance(content, list):
-                        new_content = []
-                        for c in content:
-                            if c.get("type") == "image_url":
-                                url_val = c.get("image_url", {}).get("url", "")
-                                if url_val.startswith("data:image/"):
-                                    try:
-                                        media_type = url_val.split(";")[0].replace("data:", "")
-                                        b64_data = url_val.split(",")[1]
-                                        new_content.append({
-                                            "type": "image",
-                                            "source": {"type": "base64", "media_type": media_type, "data": b64_data}
-                                        })
-                                    except Exception:
-                                        pass
-                                else:
-                                    new_content.append({"type": "text", "text": f"[Image URL: {url_val}]"})
-                            else:
-                                new_content.append(c)
-                        messages.append({"role": role, "content": new_content})
-                    else:
-                        messages.append(m)
+                    _anthropic_append_message(
+                        messages, "user", _anthropic_user_content_blocks(m.get("content"))
+                    )
             if sys_prompt:
                 anthropic_payload["system"] = sys_prompt.strip()
             anthropic_payload["messages"] = messages
+            anthropic_tools = _anthropic_tools_from_chat(payload.get("tools"))
+            if anthropic_tools:
+                anthropic_payload["tools"] = anthropic_tools
+                tool_choice = _anthropic_tool_choice_from_chat(payload.get("tool_choice"))
+                if tool_choice:
+                    anthropic_payload["tool_choice"] = tool_choice
+            if "stop" in payload:
+                stop = payload["stop"]
+                anthropic_payload["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+            if "user" in payload:
+                anthropic_payload["metadata"] = {"user_id": str(payload["user"])}
             data = json.dumps(anthropic_payload).encode("utf-8")
         else:
             url = ep.base_url.rstrip("/") + "/chat/completions"
-            data = json.dumps(payload).encode("utf-8")
+            chat_payload = {
+                k: v for k, v in payload.items()
+                if k not in ("store", "previous_response_id", "metadata")
+            }
+            data = json.dumps(chat_payload).encode("utf-8")
             
         is_stream = payload.get("stream", False)
         
@@ -893,6 +1895,10 @@ class APIPool:
                         final_cached_tokens = 0
                         has_usage = False
                         final_completion_text = ""
+                        tool_calls_state = {}
+                        anthropic_tool_blocks = {}
+                        responses_tool_states = {}
+                        done_sent = False
                         try:
                             for line in resp:
                                 if is_anthropic:
@@ -903,16 +1909,57 @@ class APIPool:
                                     try:
                                         chunk = json.loads(line[6:].decode("utf-8"))
                                         ctype = chunk.get("type")
-                                        if ctype == "content_block_delta":
-                                            text = chunk.get("delta", {}).get("text", "")
-                                            final_completion_text += text
-                                            if text:
+                                        if ctype == "content_block_start":
+                                            block = chunk.get("content_block", {})
+                                            if block.get("type") == "tool_use":
+                                                idx = chunk.get("index", len(anthropic_tool_blocks))
+                                                anthropic_tool_blocks[idx] = {
+                                                    "id": block.get("id", ""),
+                                                    "name": block.get("name", ""),
+                                                    "arguments": ""
+                                                }
+                                        elif ctype == "content_block_delta":
+                                            delta = chunk.get("delta", {})
+                                            if delta.get("type") == "input_json_delta":
+                                                idx = chunk.get("index", 0)
+                                                if idx in anthropic_tool_blocks:
+                                                    anthropic_tool_blocks[idx]["arguments"] += delta.get("partial_json", "")
+                                            else:
+                                                text = delta.get("text", "")
+                                                final_completion_text += text
+                                                if text:
+                                                    o_chunk = {
+                                                        "id": stream_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": ep.model,
+                                                        "choices": [{"index": 0, "delta": {"content": text}}]
+                                                    }
+                                                    yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                        elif ctype == "content_block_stop":
+                                            idx = chunk.get("index", 0)
+                                            block = anthropic_tool_blocks.get(idx)
+                                            if block:
                                                 o_chunk = {
                                                     "id": stream_id,
                                                     "object": "chat.completion.chunk",
                                                     "created": int(time.time()),
                                                     "model": ep.model,
-                                                    "choices": [{"index": 0, "delta": {"content": text}}]
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": [{
+                                                                "index": idx,
+                                                                "id": block["id"],
+                                                                "type": "function",
+                                                                "function": {
+                                                                    "name": block["name"],
+                                                                    "arguments": block["arguments"]
+                                                                }
+                                                            }]
+                                                        },
+                                                        "finish_reason": "tool_calls"
+                                                    }]
                                                 }
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                         elif ctype == "message_stop":
@@ -944,6 +1991,136 @@ class APIPool:
                                             has_usage = True
                                     except Exception:
                                         pass
+                                elif is_responses:
+                                    if not line.strip() or not line.startswith(b"data: "):
+                                        continue
+                                    payload_line = line[6:].strip()
+                                    if payload_line == b"[DONE]":
+                                        continue
+                                    try:
+                                        evt = json.loads(payload_line.decode("utf-8"))
+                                    except Exception:
+                                        continue
+                                    etype = evt.get("type")
+                                    if etype == "response.output_text.delta":
+                                        text = evt.get("delta", "")
+                                        final_completion_text += text
+                                        if text:
+                                            o_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [{"index": 0, "delta": {"content": text}}]
+                                            }
+                                            yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                    elif etype == "response.output_item.added":
+                                        item = evt.get("item") or {}
+                                        if item.get("type") == "function_call":
+                                            idx = evt.get("output_index", len(responses_tool_states))
+                                            responses_tool_states[idx] = {
+                                                "id": item.get("call_id", ""),
+                                                "name": item.get("name", ""),
+                                                "arguments": item.get("arguments", "") or "",
+                                                "emitted": False
+                                            }
+                                    elif etype == "response.function_call_arguments.delta":
+                                        idx = evt.get("output_index", len(responses_tool_states))
+                                        state = responses_tool_states.setdefault(idx, {
+                                            "id": "", "name": "", "arguments": "", "emitted": False
+                                        })
+                                        state["arguments"] += evt.get("delta", "")
+                                    elif etype == "response.function_call_arguments.done":
+                                        idx = evt.get("output_index", len(responses_tool_states))
+                                        state = responses_tool_states.setdefault(idx, {
+                                            "id": "", "name": "", "arguments": "", "emitted": False
+                                        })
+                                        state["id"] = evt.get("call_id", state["id"])
+                                        state["name"] = evt.get("name", state["name"])
+                                        state["arguments"] = evt.get("arguments", state["arguments"])
+                                        if not state["emitted"]:
+                                            state["emitted"] = True
+                                            o_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "tool_calls": [{
+                                                            "index": idx,
+                                                            "id": state["id"],
+                                                            "type": "function",
+                                                            "function": {
+                                                                "name": state["name"],
+                                                                "arguments": state["arguments"]
+                                                            }
+                                                        }]
+                                                    },
+                                                    "finish_reason": "tool_calls"
+                                                }]
+                                            }
+                                            yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                    elif etype == "response.output_item.done":
+                                        item = evt.get("item") or {}
+                                        if item.get("type") == "function_call":
+                                            idx = evt.get("output_index", len(responses_tool_states))
+                                            state = responses_tool_states.setdefault(idx, {
+                                                "id": "", "name": "", "arguments": "", "emitted": False
+                                            })
+                                            state["id"] = item.get("call_id", state["id"])
+                                            state["name"] = item.get("name", state["name"])
+                                            state["arguments"] = item.get("arguments", state["arguments"])
+                                            if not state["emitted"]:
+                                                state["emitted"] = True
+                                                o_chunk = {
+                                                    "id": stream_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": ep.model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": [{
+                                                                "index": idx,
+                                                                "id": state["id"],
+                                                                "type": "function",
+                                                                "function": {
+                                                                    "name": state["name"],
+                                                                    "arguments": state["arguments"]
+                                                                }
+                                                            }]
+                                                        },
+                                                        "finish_reason": "tool_calls"
+                                                    }]
+                                                }
+                                                yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                    elif etype == "response.completed":
+                                        response_obj = evt.get("response") or {}
+                                        u = response_obj.get("usage") or {}
+                                        if u:
+                                            final_prompt_tokens = u.get("input_tokens", 0)
+                                            final_cached_tokens = (u.get("input_tokens_details") or {}).get("cached_tokens", 0)
+                                            final_completion_tokens = u.get("output_tokens", 0)
+                                            final_total_tokens = u.get("total_tokens", 0)
+                                            has_usage = True
+                                            usage_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [],
+                                                "usage": {
+                                                    "prompt_tokens": final_prompt_tokens,
+                                                    "completion_tokens": final_completion_tokens,
+                                                    "total_tokens": final_total_tokens
+                                                }
+                                            }
+                                            yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
+                                        yield b"data: [DONE]\n\n"
+                                        done_sent = True
+                                        break
                                 else:
                                     yield line
                                     if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
@@ -953,6 +2130,18 @@ class APIPool:
                                                 delta = chunk["choices"][0].get("delta", {})
                                                 if "content" in delta:
                                                     final_completion_text += delta.get("content", "")
+                                                for tc in delta.get("tool_calls") or []:
+                                                    idx = tc.get("index", len(tool_calls_state))
+                                                    state = tool_calls_state.setdefault(idx, {
+                                                        "id": "", "name": "", "arguments": ""
+                                                    })
+                                                    if tc.get("id"):
+                                                        state["id"] = tc["id"]
+                                                    fn = tc.get("function") or {}
+                                                    if fn.get("name"):
+                                                        state["name"] = fn["name"]
+                                                    if fn.get("arguments"):
+                                                        state["arguments"] += fn.get("arguments", "")
                                             if "usage" in chunk and chunk["usage"]:
                                                 u = chunk["usage"]
                                                 final_prompt_tokens = u.get("prompt_tokens", 0)
@@ -963,22 +2152,82 @@ class APIPool:
                                                 has_usage = True
                                         except Exception:
                                             pass
+                            if is_responses and not done_sent:
+                                yield b"data: [DONE]\n\n"
                         except Exception:
                             pass
                         finally:
+                            tool_calls = []
+                            for idx in sorted(tool_calls_state):
+                                state = tool_calls_state[idx]
+                                if state["id"] or state["name"]:
+                                    tool_calls.append({
+                                        "id": state["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": state["name"],
+                                            "arguments": state["arguments"]
+                                        }
+                                    })
+                            for idx in sorted(anthropic_tool_blocks):
+                                block = anthropic_tool_blocks[idx]
+                                tool_calls.append({
+                                    "id": block["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": block["name"],
+                                        "arguments": block["arguments"]
+                                    }
+                                })
+                            for idx in sorted(responses_tool_states):
+                                state = responses_tool_states[idx]
+                                tool_calls.append({
+                                    "id": state["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": state["name"],
+                                        "arguments": state["arguments"]
+                                    }
+                                })
+                            meta["message"] = {
+                                "role": "assistant",
+                                "content": final_completion_text,
+                                "tool_calls": tool_calls or None
+                            }
+                            meta["usage"] = {
+                                "prompt_tokens": final_prompt_tokens,
+                                "completion_tokens": final_completion_tokens,
+                                "total_tokens": final_total_tokens,
+                                "prompt_tokens_details": {"cached_tokens": final_cached_tokens},
+                                "completion_tokens_details": {"reasoning_tokens": 0}
+                            }
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, final_cached_tokens)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text, final_total_tokens, int((time.time() - req_t0) * 1000))
                                 ep._today_used += final_total_tokens
                             resp.close()
-                    return stream_generator(), ""
+                    return stream_generator(), "", meta
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
                     if is_anthropic:
                         reply = ""
+                        tool_calls = []
                         for c in body.get("content", []):
-                            if c.get("type") == "text": reply += c.get("text", "")
+                            if c.get("type") == "text":
+                                reply += c.get("text", "")
+                            elif c.get("type") == "tool_use":
+                                tool_calls.append({
+                                    "id": c.get("id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.get("name", ""),
+                                        "arguments": json.dumps(c.get("input", {}), ensure_ascii=False)
+                                    }
+                                })
                         u = body.get("usage", {})
+                        prompt_t = 0
+                        tot = 0
+                        cached = 0
                         if u:
                             prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                             tot = prompt_t + u.get("output_tokens", 0)
@@ -987,9 +2236,50 @@ class APIPool:
                                 token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, cached)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip(), tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
-                        return reply.strip(), ""
+                        meta["message"] = {
+                            "role": "assistant",
+                            "content": reply.strip(),
+                            "tool_calls": tool_calls or None
+                        }
+                        meta["usage"] = {
+                            "prompt_tokens": prompt_t,
+                            "completion_tokens": u.get("output_tokens", 0),
+                            "total_tokens": tot,
+                            "prompt_tokens_details": {"cached_tokens": cached},
+                            "completion_tokens_details": {"reasoning_tokens": 0}
+                        }
+                        return reply.strip(), "", meta
+                    elif is_responses:
+                        text, tool_calls = _responses_output_to_chat_message(body.get("output", []))
+                        u = body.get("usage") or {}
+                        chat_usage = _responses_usage_to_chat_usage(u)
+                        if log_usage and not ep.name.startswith("test_"):
+                            token_tracker.add_usage(
+                                ep.name, ep.model,
+                                chat_usage["prompt_tokens"],
+                                chat_usage["completion_tokens"],
+                                chat_usage["total_tokens"],
+                                chat_usage["prompt_tokens_details"].get("cached_tokens", 0)
+                            )
+                            chat_logger.add_log(
+                                ep.name, ep.model,
+                                prompt_text_to_log,
+                                text.strip(),
+                                chat_usage["total_tokens"],
+                                int((time.time() - req_t0) * 1000)
+                            )
+                            ep._today_used += chat_usage["total_tokens"]
+                        meta["message"] = {
+                            "role": "assistant",
+                            "content": text.strip(),
+                            "tool_calls": tool_calls or None
+                        }
+                        meta["usage"] = chat_usage
+                        return text.strip(), "", meta
                     else:
                         u = body.get("usage", {})
+                        tot = 0
+                        cached = 0
                         if u:
                             tot = u.get("total_tokens", 0)
                             cached = 0
@@ -1000,8 +2290,17 @@ class APIPool:
                                 content = body["choices"][0]["message"].get("content", "")
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, content.strip(), tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
-                        content = body["choices"][0]["message"].get("content", "")
-                        return (content.strip() if content else ""), ""
+                        message = body["choices"][0]["message"]
+                        content = message.get("content", "")
+                        meta["message"] = message
+                        meta["usage"] = {
+                            "prompt_tokens": u.get("prompt_tokens", 0) if u else 0,
+                            "completion_tokens": u.get("completion_tokens", 0) if u else 0,
+                            "total_tokens": tot if u else 0,
+                            "prompt_tokens_details": {"cached_tokens": cached},
+                            "completion_tokens_details": u.get("completion_tokens_details", {}) if u else {}
+                        }
+                        return (content.strip() if content else ""), "", meta
                     
                     
             except urllib.error.HTTPError as e:
@@ -1015,26 +2314,30 @@ class APIPool:
                     cleaned = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
                     sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301 temperature/top_p\uff0c\u5df2\u81ea\u52a8\u79fb\u9664\u540e\u91cd\u8bd5", "WARNING")
                     return self._try_endpoint(ep, cleaned, timeout, log_usage=log_usage, force_no_retry=True)
-                if e.code == 429: return None, msg + " (429 rate-limited)"
-                if e.code in (401, 403): return None, msg + " (auth error)"
+                if e.code == 429: return None, msg + " (429 rate-limited)", meta
+                if e.code in (401, 403): return None, msg + " (auth error)", meta
                 if e.code >= 500:
                     if attempt < retries:
                         time.sleep(1.5 * (attempt + 1))
                         continue
-                    return None, msg
-                return None, msg
+                    return None, msg, meta
+                return None, msg, meta
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 msg = f"连接/超时错误: {e}"
                 if attempt < retries:
                     time.sleep(1.5 * (attempt + 1))
                     continue
-                return None, msg
+                return None, msg, meta
             except Exception as e:
-                return None, f"未知错误: {e}"
-        return None, "重试次数用尽"
+                return None, f"未知错误: {e}", meta
+        return None, "重试次数用尽", meta
 
     def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai"):
-        url = base_url.rstrip("/") + "/models"
+        base = base_url.rstrip("/")
+        if protocol == "anthropic" and "api.anthropic.com" in base and not base.endswith("/v1"):
+            url = base + "/v1/models"
+        else:
+            url = base + "/models"
         req = urllib.request.Request(url, method="GET")
         req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         safe_api_key = api_key.encode('ascii', 'ignore').decode('ascii').strip()
@@ -1082,7 +2385,7 @@ class APIPool:
             "max_tokens": 10,
         }
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout)
+        reply, err, _ = self._try_endpoint(ep, payload, timeout)
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None:
@@ -1102,7 +2405,7 @@ class APIPool:
         ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol)
         payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout)
+        reply, err, _ = self._try_endpoint(ep, payload, timeout)
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None:
@@ -1147,6 +2450,22 @@ def api_handler(method, path, body):
     cp = parsed.path
 
     # ================= 代理接口 =================
+    if method == "GET" and (cp.startswith("/v1/responses/") or cp.startswith("/responses/")):
+        rid = unquote(cp.rsplit("/", 1)[-1])
+        stored = _responses_store_get(rid)
+        if stored:
+            return 200, stored.get("response", stored), False
+        return 404, {"error": {"message": "Response not found", "type": "invalid_request_error", "param": None, "code": None}}, False
+
+    if method == "DELETE" and (cp.startswith("/v1/responses/") or cp.startswith("/responses/")):
+        rid = unquote(cp.rsplit("/", 1)[-1])
+        if _responses_store_delete(rid):
+            return 200, {"deleted": True, "id": rid}, False
+        return 404, {"error": {"message": "Response not found", "type": "invalid_request_error", "param": None, "code": None}}, False
+
+    if method == "POST" and cp in ("/v1/responses", "/responses"):
+        return _handle_responses(body)
+
     if method == "POST" and cp in ("/v1/chat/completions", "/chat/completions"):
         messages = body.get("messages", [])
         is_stream = body.get("stream", False)
@@ -1160,16 +2479,32 @@ def api_handler(method, path, body):
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
         
         try:
-            result = pool.chat(messages, extra_payload=extra_payload)
-            if is_stream: return 200, result, True 
+            if is_stream:
+                result = pool.chat(messages, extra_payload=extra_payload)
+                return 200, result, True
+            result, served_ep, meta = pool.chat(
+                messages,
+                extra_payload=extra_payload,
+                return_endpoint=True,
+                return_meta=True
+            )
+            message = meta.get("message") or {"role": "assistant", "content": result}
+            usage = meta.get("usage") or {}
+            finish_reason = "tool_calls" if message.get("tool_calls") else "stop"
             
             response = {
                 "id": f"chatcmpl-{int(time.time()*1000)}",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": "api-pool-aggregated",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": result}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                "model": served_ep.model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                    "prompt_tokens_details": usage.get("prompt_tokens_details") or {},
+                    "completion_tokens_details": usage.get("completion_tokens_details") or {}
+                }
             }
             return 200, response, False
             
@@ -1289,6 +2624,79 @@ def api_handler(method, path, body):
     if method == "POST" and cp == "/api/reset": pool.reset(); return 200, {"ok": True}, False
 
     return 404, {"error": "Not found"}, False
+
+
+def _handle_responses(body):
+    try:
+        messages, extra_payload = _responses_to_chat_request(body)
+    except ValueError as e:
+        return 400, {"error": {"message": str(e), "type": "invalid_request_error", "param": None, "code": None}}, False
+
+    previous_response_id = body.get("previous_response_id")
+    if previous_response_id:
+        stored = _responses_store_get(previous_response_id)
+        if stored:
+            stored_messages = stored.get("messages") or []
+            if stored_messages:
+                messages = stored_messages + messages
+        else:
+            return 400, {"error": {
+                "message": f"previous_response_id '{previous_response_id}' not found",
+                "type": "invalid_request_error",
+                "param": "previous_response_id",
+                "code": None
+            }}, False
+
+    is_stream = bool(body.get("stream", False))
+    extra_payload["stream"] = is_stream
+    if is_stream:
+        if "stream_options" not in extra_payload:
+            extra_payload["stream_options"] = {"include_usage": True}
+        elif isinstance(extra_payload["stream_options"], dict):
+            extra_payload["stream_options"]["include_usage"] = True
+
+    response_id = f"resp_{int(time.time() * 1000)}"
+    item_id = f"msg_{int(time.time() * 1000)}"
+
+    def maybe_store(response_obj):
+        if body.get("store"):
+            _responses_store_put(response_obj.get("id") or response_id, {
+                "messages": messages,
+                "response": response_obj
+            })
+
+    try:
+        result, served_ep, meta = pool.chat(
+            messages,
+            extra_payload=extra_payload,
+            return_endpoint=True,
+            return_meta=True
+        )
+        if is_stream:
+            return 200, _responses_stream_generator(
+                result, body,
+                meta=meta,
+                model=served_ep.model,
+                response_id=response_id,
+                item_id=item_id,
+                on_complete=maybe_store
+            ), True
+        text = result if isinstance(result, str) else str(result or "")
+        response_obj = _responses_response_object(
+            body, text,
+            usage=_responses_usage_from_chat_usage(meta.get("usage")),
+            model=served_ep.model,
+            message=meta.get("message"),
+            response_id=response_id,
+            item_id=item_id
+        )
+        maybe_store(response_obj)
+        return 200, response_obj, False
+    except AllEndpointsFailed as e:
+        return 500, {"error": {"message": f"所有端点均已失败: {e.errors}", "type": "server_error", "param": None, "code": None}}, False
+    except Exception as e:
+        return 500, {"error": {"message": str(e), "type": "server_error", "param": None, "code": None}}, False
+
 
 def _sync_to_config():
     save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True)} for ep in pool.list_endpoints()])
@@ -1537,6 +2945,7 @@ select option { background: var(--bg); color: var(--text); }
     <div><span style="color: var(--text-dim); margin-right: 6px;">接口地址 (Base URL):</span><code id="displayUrl">http://localhost:5100/v1</code></div>
     <div><span style="color: var(--text-dim); margin-right: 6px;">API Key:</span><code>sk-any</code> <span style="font-size: 11px; color: var(--text-dim);">(任意填写)</span></div>
     <div><span style="color: var(--text-dim); margin-right: 6px;">模型 (Model):</span><code>api-pool</code> <span style="font-size: 11px; color: var(--text-dim);">(任意填写)</span></div>
+    <div><span style="color: var(--text-dim); margin-right: 6px;">Responses API:</span><code>/v1/responses</code> <span style="font-size: 11px; color: var(--text-dim);">(入站适配)</span></div>
   </div>
 </div>
 
@@ -1704,7 +3113,7 @@ select option { background: var(--bg); color: var(--text); }
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
       <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="true">随系统</option><option value="false">强制直连</option></select></div>
-      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
+      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic</option></select></div>
     </div>
     <div class="form-group">
       <label>后台探针</label>
@@ -1785,6 +3194,7 @@ function renderEndpoints(eps){
     if(ep.is_rpm_limited)cls+=' in-cooldown';
     let b=`<span class="badge badge-priority">#${ep.priority}</span>${hBadge(ep.health,ep.health_latency_ms)}`;
     if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
+    else if(ep.protocol==='responses')b+=`<span class="badge" style="background:rgba(94,92,230,0.2);color:#9d9aff;border:1px solid rgba(94,92,230,0.3)" title="OpenAI Responses 原生协议">🔷Responses</span>`;
     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
     if(ep.is_current)b+='<span class="badge badge-current">● 当前</span>';
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
@@ -2609,7 +4019,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(code)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                     self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     for chunk in stream_gen:
                         self.wfile.write(chunk)
@@ -2618,6 +4028,9 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             else:
                 self._send_json(res[0], res[1])
+        elif self.path.startswith(("/v1/", "/responses/")):
+            res = api_handler("GET", self.path, {})
+            self._send_json(res[0], res[1])
         else:
             self._send_json(404, {"error": "Not found"})
 
@@ -2631,7 +4044,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(code)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 
                 for chunk in stream_gen:
@@ -2662,6 +4075,7 @@ def main():
     print(f"\n  ⚡ API Pool 管理面板已启动")
     print(f"  🌐 管理面板访问: http://localhost:{port}")
     print(f"  🔗 客户端 Base URL: http://localhost:{port}/v1")
+    print(f"  🔗 Responses API: http://localhost:{port}/v1/responses")
     print(f"  📋 已加载 {len(pool._endpoints)} 个端点")
     print(f"  🩺 健康检测: 启动时自动检测 + 每 {HEALTH_CHECK_INTERVAL}秒 复检\n")
     try:
