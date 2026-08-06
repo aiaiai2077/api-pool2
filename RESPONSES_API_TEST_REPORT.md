@@ -12,9 +12,9 @@
 
 | 结果 | 数量 |
 | --- | --- |
-| 通过 | 7 |
+| 通过 | 9 |
 | 失败 | 0 |
-| 总计 | 7 |
+| 总计 | 9 |
 
 ## 覆盖范围
 
@@ -38,10 +38,14 @@
    - 流式响应完成后继续续接
    - `GET /v1/responses/{id}` 检索
    - `DELETE /v1/responses/{id}` 删除
-6. 错误处理
+6. 上游流式结束标记
+   - Responses 协议上游转 chat 流时输出 `finish_reason` 结束 chunk
+   - Anthropic 上游 `message_stop` 同样补齐结束 chunk
+   - 上游 `response.completed` 不带 usage 时仍保持单次结束
+7. 错误处理
    - 缺 `input` 返回 400
    - 无效 `previous_response_id` 返回 400
-7. 回归
+8. 回归
    - 旧 `/v1/chat/completions` 非流式与流式
    - 健康检查、延迟测试调用点
 
@@ -68,6 +72,7 @@ Claude 测试覆盖：工具定义、`tool_choice`、多轮 tool_use/tool_result
 - 无 tools 时不再发送 `tool_choice`，避免严格供应商报 400。
 - 原生 Responses 流式兼容 `response.function_call_arguments.done` 作为工具调用收尾，不依赖 `output_item.done`。
 - Responses 流式事件统一补充 `response_id` 字段，提升 SDK 兼容性。
+- Responses / Anthropic 上游转 chat 流时补齐 `finish_reason` 结束 chunk，避免客户端（如 Hermes Studio）把正常结束误判为中途截断。
 - 官方 `api.anthropic.com` 未带 `/v1` 的 base_url 会自动补全 `/v1/messages` 和 `/v1/models`。
 - Responses `text.format` 结构化输出会映射为 chat 的 `response_format`，原生 Responses 上游会反向还原为 `text`。
 - 本地 `store` 改为 SQLite 持久化（`responses_store.db`），重启不丢，容量仍限制为 200 条。
@@ -76,6 +81,16 @@ Claude 测试覆盖：工具定义、`tool_choice`、多轮 tool_use/tool_result
 
 - `reasoning` 仅透传 effort，未输出 summary。
 - 未使用真实供应商 key 做网络实测。
+
+## Hermes Studio 截断提示排查
+
+Hermes Studio 界面报 `Error: Response remained truncated after 4 continuation attempts`，根因不在 Hermes：
+
+- Hermes 通过自定义 Provider（`custom:api-pool`，Base URL `http://127.0.0.1:5100/v1`）调用 API Pool。
+- 上游 OpenCode 走原生 Responses 协议时，API Pool 之前只转发内容 delta，随后直接发送 `usage` + `[DONE]`，没有带 `finish_reason` 的结束 chunk。
+- Hermes 把这种流判为“中途截断”，自动续写，连续 4 次仍无结束标记后报错。
+- 已修复：Responses / Anthropic 上游转 chat 流时在结束前补齐 `finish_reason`（文本 `stop`、工具 `tool_calls`、超限 `length`），并新增对应测试。
+- 另外 OpenCode 的 `deepseek-v4-flash` 是推理模型，输出预算大部分消耗在 reasoning 上，正文通常很短；如希望正文更长，可在 Hermes 模型设置或请求里调大 `max_tokens` / `max_output_tokens`。
 
 ## 结论
 

@@ -302,6 +302,119 @@ class ResponsesUpstreamMock(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
+class ResponsesTextUpstreamMock(BaseHTTPRequestHandler):
+    calls = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.calls.append(body)
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            response = {
+                "id": "resp_up_text_1",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "output": [{
+                    "id": "msg_up_text_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                          "input_tokens_details": {"cached_tokens": 1}}
+            }
+            events = [
+                ("response.created", {"type": "response.created", "response": response}),
+                ("response.output_text.delta", {"type": "response.output_text.delta",
+                                                "item_id": "msg_up_text_1", "output_index": 0,
+                                                "content_index": 0, "delta": "hel"}),
+                ("response.output_text.delta", {"type": "response.output_text.delta",
+                                                "item_id": "msg_up_text_1", "output_index": 0,
+                                                "content_index": 0, "delta": "lo"}),
+                ("response.output_item.done", {"type": "response.output_item.done", "output_index": 0,
+                                               "item": response["output"][0]}),
+                ("response.completed", {"type": "response.completed", "response": response})
+            ]
+            for event_type, data in events:
+                self.wfile.write(
+                    f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+                )
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        else:
+            data = json.dumps({
+                "id": "resp_up_text_1",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "output": [{
+                    "id": "msg_up_text_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19,
+                          "input_tokens_details": {"cached_tokens": 2}}
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+
+class ResponsesNoUsageTextMock(BaseHTTPRequestHandler):
+    calls = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.calls.append(body)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        response = {
+            "id": "resp_up_nousage_1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [{
+                "id": "msg_up_nousage_1",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+            }]
+        }
+        events = [
+            ("response.created", {"type": "response.created", "response": response}),
+            ("response.output_text.delta", {"type": "response.output_text.delta",
+                                            "item_id": "msg_up_nousage_1", "output_index": 0,
+                                            "content_index": 0, "delta": "hi"}),
+            ("response.completed", {"type": "response.completed", "response": response})
+        ]
+        for event_type, data in events:
+            self.wfile.write(
+                f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+            )
+            self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+
 def parse_sse(raw):
     events = []
     for block in raw.decode("utf-8").split("\n\n"):
@@ -519,7 +632,49 @@ def test_native_responses_upstream():
 
     status, _, body = request(base, "POST", "/v1/chat/completions",
                               {"messages": [{"role": "user", "content": "hi"}], "stream": True})
-    assert status == 200 and b"checking" in body and b"data: [DONE]" in body
+    assert status == 200 and b"checking" in body
+    assert b'"finish_reason": "tool_calls"' in body
+    assert b"data: [DONE]" in body
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
+def test_responses_upstream_chat_stream_finish_reason():
+    ResponsesTextUpstreamMock.calls.clear()
+    server, port = start_server(ResponsesTextUpstreamMock)
+    set_pool(f"http://127.0.0.1:{port}", protocol="responses", name="test_resp_text_up")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, body = request(base, "POST", "/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    assert status == 200
+    assert b'"content": "hel"' in body and b'"content": "lo"' in body
+    assert b'"finish_reason": "stop"' in body
+    assert b"data: [DONE]" in body
+    assert body.rindex(b'"finish_reason": "stop"') < body.rindex(b"data: [DONE]")
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
+def test_responses_upstream_chat_stream_finish_without_usage():
+    ResponsesNoUsageTextMock.calls.clear()
+    server, port = start_server(ResponsesNoUsageTextMock)
+    set_pool(f"http://127.0.0.1:{port}", protocol="responses", name="test_resp_nousage_up")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, body = request(base, "POST", "/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    assert status == 200
+    assert body.count(b'"finish_reason": "stop"') == 1
+    assert body.count(b"data: [DONE]") == 1
     app_server.shutdown()
     app_server.server_close()
     server.shutdown()
@@ -624,6 +779,8 @@ def main():
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
     check("Anthropic upstream tool calls (non-stream + stream)", test_anthropic_tool_calls)
     check("native Responses upstream (inbound + chat regression)", test_native_responses_upstream)
+    check("Responses upstream chat stream emits finish_reason", test_responses_upstream_chat_stream_finish_reason)
+    check("Responses upstream finish without usage stays single-ended", test_responses_upstream_chat_stream_finish_without_usage)
     check("store / previous_response_id / retrieve / delete chain", test_store_previous_reasoning_retrieve_delete)
     check("error cases", test_error_cases)
     check("chat completions regression + health call sites", test_regression_chat_and_health_call_sites)

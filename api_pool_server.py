@@ -1899,6 +1899,17 @@ class APIPool:
                         anthropic_tool_blocks = {}
                         responses_tool_states = {}
                         done_sent = False
+                        anthropic_stop_reason = None
+
+                        def finish_chunk(reason):
+                            return b"data: " + json.dumps({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": ep.model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+                            }).encode("utf-8") + b"\n\n"
+
                         try:
                             for line in resp:
                                 if is_anthropic:
@@ -1963,6 +1974,13 @@ class APIPool:
                                                 }
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                         elif ctype == "message_stop":
+                                            finish_reason = "tool_calls" if anthropic_tool_blocks else {
+                                                "end_turn": "stop",
+                                                "stop_sequence": "stop",
+                                                "max_tokens": "length",
+                                                "tool_use": "tool_calls",
+                                            }.get(anthropic_stop_reason, "stop")
+                                            yield finish_chunk(finish_reason)
                                             usage_chunk = {
                                                 "id": stream_id,
                                                 "object": "chat.completion.chunk",
@@ -1977,11 +1995,14 @@ class APIPool:
                                             }
                                             yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
                                             yield b"data: [DONE]\n\n"
+                                            done_sent = True
                                         elif ctype == "message_delta" and "usage" in chunk:
                                             u = chunk["usage"]
                                             final_completion_tokens += u.get("output_tokens", 0)
                                             final_total_tokens += u.get("output_tokens", 0)
                                             has_usage = True
+                                            if isinstance(chunk.get("delta"), dict) and chunk["delta"].get("stop_reason"):
+                                                anthropic_stop_reason = chunk["delta"]["stop_reason"]
                                         elif ctype == "message_start" and "message" in chunk and "usage" in chunk["message"]:
                                             u = chunk["message"]["usage"]
                                             prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
@@ -2098,6 +2119,15 @@ class APIPool:
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                     elif etype == "response.completed":
                                         response_obj = evt.get("response") or {}
+                                        incomplete = response_obj.get("incomplete_details") or {}
+                                        finish_reason = (
+                                            "length"
+                                            if response_obj.get("status") == "incomplete"
+                                            or incomplete.get("reason") == "max_output_tokens"
+                                            else "stop"
+                                        )
+                                        if not responses_tool_states:
+                                            yield finish_chunk(finish_reason)
                                         u = response_obj.get("usage") or {}
                                         if u:
                                             final_prompt_tokens = u.get("input_tokens", 0)
@@ -2153,6 +2183,8 @@ class APIPool:
                                         except Exception:
                                             pass
                             if is_responses and not done_sent:
+                                if not responses_tool_states:
+                                    yield finish_chunk("stop")
                                 yield b"data: [DONE]\n\n"
                         except Exception:
                             pass
