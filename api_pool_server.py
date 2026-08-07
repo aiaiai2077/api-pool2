@@ -3351,7 +3351,7 @@ select option { background: var(--bg); color: var(--text); }
       </div>
     <div class="form-row" style="grid-template-columns: 1fr 1fr;">
       <div class="form-group"><label title="该端点原生支持 xhigh 推理强度时开启，开启后不再把 xhigh 降级为 high">原生 xhigh 推理</label><select id="fXHigh"><option value="false">否 (自动降级)</option><option value="true">是 (原样透传)</option></select></div>
-      <div class="form-group"><label title="该端点最高支持的推理档位，超过的请求会自动降到该档；留空表示不限制">最高推理档位</label><select id="fMaxEffort"><option value="">不限</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></div>
+      <div class="form-group"><label title="该端点最高支持的推理档位，超过的请求会自动降到该档；留空表示不限制">最高推理档位</label><select id="fMaxEffort"><option value="">不限</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
