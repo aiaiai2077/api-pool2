@@ -489,6 +489,44 @@ def test_inbound_openai_text():
     server.server_close()
 
 
+def test_reasoning_xhigh_normalized_for_upstream():
+    server, port = start_server(TextChatMock)
+    set_pool(f"http://127.0.0.1:{port}")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    assert m._normalize_reasoning_effort("xhigh") == "high"
+    assert m._normalize_reasoning_effort("xlow") == "low"
+    assert m._normalize_reasoning_effort("minimal") == "low"
+    assert m._normalize_reasoning_effort("high") == "high"
+
+    TextChatMock.calls.clear()
+    status, _, body = request(base, "POST", "/v1/responses", {
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "reasoning": {"effort": "xhigh"}
+    })
+    assert status == 200
+    resp = json.loads(body)
+    assert resp["reasoning"]["effort"] == "xhigh"
+    sent = TextChatMock.calls[-1]
+    assert sent.get("reasoning_effort") == "high"
+
+    TextChatMock.calls.clear()
+    status, _, body = request(base, "POST", "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "xhigh"
+    })
+    assert status == 200
+    sent = TextChatMock.calls[-1]
+    assert sent.get("reasoning_effort") == "high"
+
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
 def test_openai_tool_calls():
     ToolChatMock.calls.clear()
     server, port = start_server(ToolChatMock)
@@ -776,6 +814,7 @@ def test_regression_chat_and_health_call_sites():
 
 def main():
     check("inbound /v1/responses over OpenAI chat upstream (text/image/reasoning/stream)", test_inbound_openai_text)
+    check("reasoning effort xhigh normalized for upstream", test_reasoning_xhigh_normalized_for_upstream)
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
     check("Anthropic upstream tool calls (non-stream + stream)", test_anthropic_tool_calls)
     check("native Responses upstream (inbound + chat regression)", test_native_responses_upstream)

@@ -24,6 +24,19 @@ LATENCY_OK_MAX = 2000
 LATENCY_SLOW_MAX = 5000   
 HEALTH_CHECK_INTERVAL = 120  
 
+REASONING_EFFORT_MAP = {
+    "xhigh": "high",
+    "xlow": "low",
+    "minimal": "low",
+}
+
+def _normalize_reasoning_effort(effort):
+    if not isinstance(effort, str):
+        return effort
+    key = effort.strip().lower()
+    return REASONING_EFFORT_MAP.get(key, effort)
+
+
 class LogManager:
     def __init__(self, max_history=300):
         self.history = []
@@ -1823,6 +1836,11 @@ class APIPool:
                 "model": ep_model, "messages": messages,
                 **self.default_payload, **(extra_payload or {}),
             }
+            if "reasoning_effort" in payload:
+                payload["reasoning_effort"] = _normalize_reasoning_effort(payload["reasoning_effort"])
+            reasoning = payload.get("reasoning")
+            if isinstance(reasoning, dict) and "effort" in reasoning:
+                reasoning["effort"] = _normalize_reasoning_effort(reasoning["effort"])
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
