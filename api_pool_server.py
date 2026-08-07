@@ -1537,68 +1537,171 @@ class APIPool:
             return ep.id, "bad", latency, err_str or "未知错误"
 
     def _has_images(self, messages):
-        if not messages: return False
-        for m in messages:
+        if not messages:
+            return False
+        last_user = -1
+        for i, m in enumerate(messages):
+            if m.get("role") == "user":
+                last_user = i
+        for m in (messages[last_user:] if last_user >= 0 else messages):
             content = m.get("content")
             if isinstance(content, list):
                 for c in content:
-                    if c.get("type") == "image_url": return True
+                    if c.get("type") in ("image_url", "input_image"):
+                        return True
+            elif isinstance(content, str) and "data:image/" in content:
+                return True
         return False
 
     def _translate_images_sync(self, messages, active_eps):
         vision_eps = [e for e in active_eps if getattr(e, "is_vision", True)]
         if not vision_eps:
             return messages
-            
-        translation_msgs = []
-        for m in messages:
-            if isinstance(m.get("content"), list):
-                new_content = []
-                has_image = False
-                for c in m["content"]:
-                    if c.get("type") == "image_url":
-                        has_image = True
-                        new_content.append(c)
-                if has_image:
-                    translation_msgs.append({"role": "user", "content": new_content})
-        
-        if not translation_msgs: return messages
-        
-        sys_prompt = "你是一个专业图像解析器。请将用户提供的图片内容转化为极其详细的文字描述（包括画面细节、OCR文字、代码片段等），只输出文字描述，不要有多余的客套话。"
-        translation_msgs.insert(0, {"role": "system", "content": sys_prompt})
-        
-        description = ""
-        for v_ep in vision_eps:
-            sys_log(f"启动图片解析 -> 尝试端点 {v_ep.name} ({v_ep.model})", "INFO")
-            payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
-            result, error, _ = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True)
-            if error:
-                sys_log(f"图片解析失败 ({v_ep.name} - {v_ep.model}): {error}", "WARNING")
+
+        sys_prompt = (
+            "你是一个专业图像解析器。请结合用户针对图片提出的问题，"
+            "将图片内容转化为极其详细的文字描述（包括画面细节、OCR文字、代码片段等）。"
+            "如果图片是软件界面、网页、控制台、桌面或手机截图，请额外输出结构化 UI 信息："
+            "估算视口尺寸（像素，左上角为原点），并按从左上到右下的顺序列出每个可见元素："
+            "类型（按钮/输入框/链接/图标/文本/弹窗/菜单/图片）、完整可见文字或 OCR、中心坐标与宽高（像素）。"
+            "只输出对该图片的描述或回答，不要有多余的客套话。"
+        )
+
+        import copy
+        import re
+        data_url_re = re.compile(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+        tasks = []
+        task_index = {}
+
+        def add_task(msg_idx, kind, key, accompanying, raw_url, ref):
+            task_index[(msg_idx, kind, key)] = len(tasks)
+            tasks.append((msg_idx, kind, key, accompanying, raw_url, ref))
+
+        last_user = -1
+        for i, m in enumerate(messages):
+            if m.get("role") == "user":
+                last_user = i
+
+        for msg_idx, m in enumerate(messages):
+            if msg_idx < last_user:
                 continue
-                
-            description = result if isinstance(result, str) else result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            content = m.get("content")
+            if isinstance(content, list):
+                text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                accompanying = "\n".join(t for t in text_parts if t).strip()
+                for part_idx, c in enumerate(content):
+                    if c.get("type") not in ("image_url", "input_image"):
+                        continue
+                    raw = c.get("image_url")
+                    if isinstance(raw, dict):
+                        url = raw.get("url", "")
+                        detail = c.get("detail") or raw.get("detail")
+                    else:
+                        url = raw or ""
+                        detail = c.get("detail")
+                    image = {"url": url}
+                    if detail:
+                        image["detail"] = detail
+                    add_task(msg_idx, "part", (msg_idx, part_idx), accompanying, url, {
+                        "part_idx": part_idx,
+                        "image": image,
+                    })
+            elif isinstance(content, str) and "data:image/" in content:
+                spans = []
+                for dm in data_url_re.finditer(content):
+                    start, end = dm.start(), dm.end()
+                    lb = content.rfind("{", 0, start)
+                    if lb != -1:
+                        rb = content.find("}", end)
+                        if rb != -1:
+                            block = content[lb:rb + 1]
+                            if block.count("{") == block.count("}") and "input_image" in block:
+                                start, end = lb, rb + 1
+                    spans.append((start, end, dm.group(0)))
+                if not spans:
+                    continue
+                instruction = content
+                for start, end, _ in sorted(spans, reverse=True):
+                    instruction = instruction[:start] + instruction[end:]
+                instruction = instruction.strip()
+                for span_idx, (start, end, raw_url) in enumerate(spans):
+                    add_task(msg_idx, "span", (msg_idx, span_idx), instruction, raw_url, {
+                        "start": start,
+                        "end": end,
+                    })
+
+        if not tasks:
+            return messages
+
+        desc_cache = {}
+        descriptions = {}
+        for task_idx, (msg_idx, kind, key, accompanying, raw_url, ref) in enumerate(tasks):
+            if raw_url in desc_cache:
+                descriptions[task_idx] = desc_cache[raw_url]
+                continue
+            user_content = []
+            if accompanying:
+                user_content.append({"type": "text", "text": accompanying})
+            user_content.append({"type": "image_url", "image_url": {"url": raw_url}})
+            parse_msgs = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_content},
+            ]
+            description = ""
+            for v_ep in vision_eps:
+                sys_log(f"启动图片解析 ({task_idx + 1}/{len(tasks)}) -> 尝试端点 {v_ep.name} ({v_ep.model})", "INFO")
+                payload = {"model": v_ep.model, "messages": parse_msgs, "stream": False, "max_tokens": 4096}
+                result, error, _ = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True)
+                if error:
+                    sys_log(f"图片解析失败 ({v_ep.name} - {v_ep.model}): {error}", "WARNING")
+                    continue
+                description = result if isinstance(result, str) else result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if description:
+                    break
             if description:
-                break
-                
-        if not description:
+                descriptions[task_idx] = description
+                desc_cache[raw_url] = description
+
+        if not descriptions:
             sys_log("所有图片解析端点均失败", "ERROR")
             return messages
-        
-        import copy
+
         new_msgs = copy.deepcopy(messages)
-        for m in new_msgs:
-            if isinstance(m.get("content"), list):
-                has_image = False
-                filtered_content = []
-                for c in m["content"]:
-                    if c.get("type") != "image_url":
-                        filtered_content.append(c)
+        img_no = 0
+        for msg_idx, m in enumerate(new_msgs):
+            content = m.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for part_idx, c in enumerate(content):
+                    if c.get("type") not in ("image_url", "input_image"):
+                        new_content.append(c)
+                        continue
+                    task_idx = task_index.get((msg_idx, "part", (msg_idx, part_idx)))
+                    img_no += 1
+                    desc = descriptions.get(task_idx)
+                    if desc:
+                        new_content.append({"type": "text", "text": f"\n\n[图片{img_no} 解析内容]: {desc}"})
                     else:
-                        has_image = True
-                if has_image:
-                    filtered_content.append({"type": "text", "text": f"\n\n[图片解析内容]: {description}"})
-                m["content"] = filtered_content
-        sys_log("图片解析完成", "INFO")
+                        new_content.append({"type": "text", "text": f"\n\n[图片{img_no} 解析失败]"})
+                m["content"] = new_content
+            elif isinstance(content, str):
+                spans = [ref for (mi, kind, key, acc, raw, ref) in tasks if mi == msg_idx and kind == "span"]
+                if not spans:
+                    continue
+                pieces = []
+                pos = 0
+                for idx, ref in enumerate(sorted(spans, key=lambda r: r["start"])):
+                    task_idx = task_index.get((msg_idx, "span", (msg_idx, idx)))
+                    img_no += 1
+                    desc = descriptions.get(task_idx)
+                    label = f"[图片{img_no} 解析内容]: {desc}" if desc else f"[图片{img_no} 解析失败]"
+                    pieces.append(content[pos:ref["start"]])
+                    pieces.append(label)
+                    pos = ref["end"]
+                pieces.append(content[pos:])
+                m["content"] = "".join(pieces)
+        sys_log(f"图片解析完成，共解析 {len(descriptions)}/{len(tasks)} 张", "INFO")
         return new_msgs
 
     def check_all_health(self):
@@ -1729,10 +1832,7 @@ class APIPool:
                         meta = {}
 
                         def vision_wrapper(tgt_ep, pld, t_out, a_eps):
-                            import json
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             translated_msgs = self._translate_images_sync(pld["messages"], a_eps)
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             pld["messages"] = translated_msgs
                             gen, err, inner_meta = self._try_endpoint(tgt_ep, pld, t_out)
                             if err:
