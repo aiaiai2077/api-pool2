@@ -133,7 +133,15 @@ class ReasoningCascadeMock(BaseHTTPRequestHandler):
         self.calls.append(body)
         effort = body.get("reasoning_effort")
         if effort in ("xhigh", "high", "medium"):
-            err = json.dumps({"error": {"message": f"invalid reasoning value: '{effort}'"}}).encode("utf-8")
+            err = json.dumps({
+                "error": {
+                    "message": (
+                        "Error from provider (Console Go): Upstream request failed: "
+                        "[invalid_parameter_error] <400> InternalError.Algo.InvalidParameter: "
+                        f"Range of reasoning effort, input: '{effort}', allowed: low/medium"
+                    )
+                }
+            }).encode("utf-8")
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(err)))
@@ -146,6 +154,41 @@ class ReasoningCascadeMock(BaseHTTPRequestHandler):
             "model": "mock-model",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
+        }
+        data = json.dumps(resp).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class SingleToolCallMock(BaseHTTPRequestHandler):
+    calls = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.calls.append(body)
+        if body.get("parallel_tool_calls") is not False:
+            err = json.dumps({
+                "error": {"message": "This model only supports single tool-calls at once!"}
+            }).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
+        resp = {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
         }
         data = json.dumps(resp).encode("utf-8")
         self.send_response(200)
@@ -625,6 +668,52 @@ def test_max_reasoning_effort_clamp():
     server.server_close()
 
 
+def test_single_tool_call_auto_serialize():
+    SingleToolCallMock.calls.clear()
+    server, port = start_server(SingleToolCallMock)
+    set_pool(f"http://127.0.0.1:{port}")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, body = request(base, "POST", "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "parallel_tool_calls": True
+    })
+    assert status == 200
+    assert SingleToolCallMock.calls[-1].get("parallel_tool_calls") is False
+
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
+def test_empty_assistant_message_cleaned():
+    TextChatMock.calls.clear()
+    server, port = start_server(TextChatMock)
+    set_pool(f"http://127.0.0.1:{port}")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, body = request(base, "POST", "/v1/chat/completions", {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "again"}
+        ]
+    })
+    assert status == 200
+    roles = [m["role"] for m in TextChatMock.calls[-1]["messages"]]
+    assert roles == ["user", "user"]
+
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
 def test_openai_tool_calls():
     ToolChatMock.calls.clear()
     server, port = start_server(ToolChatMock)
@@ -915,6 +1004,8 @@ def main():
     check("reasoning effort xhigh normalized for upstream", test_reasoning_xhigh_normalized_for_upstream)
     check("reasoning effort cascade downgrade on HTTP 400", test_reasoning_cascade_downgrade)
     check("reasoning effort clamped by endpoint max", test_max_reasoning_effort_clamp)
+    check("single tool call auto serialized on HTTP 400", test_single_tool_call_auto_serialize)
+    check("empty assistant messages cleaned before forwarding", test_empty_assistant_message_cleaned)
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
     check("Anthropic upstream tool calls (non-stream + stream)", test_anthropic_tool_calls)
     check("native Responses upstream (inbound + chat regression)", test_native_responses_upstream)

@@ -7,6 +7,7 @@ API Pool — 聚合 API 自动切换模块（GUI 版）
 
 import os
 import json
+import copy
 import time
 import threading
 import sqlite3
@@ -1896,6 +1897,15 @@ class APIPool:
                 "model": ep_model, "messages": messages,
                 **self.default_payload, **(extra_payload or {}),
             }
+            payload["messages"] = [
+                m for m in payload["messages"]
+                if not (
+                    m.get("role") == "assistant"
+                    and isinstance(m.get("content"), str)
+                    and not m.get("content", "").strip()
+                    and not m.get("tool_calls")
+                )
+            ]
             if "reasoning_effort" in payload:
                 payload["reasoning_effort"] = _clamp_reasoning_effort(
                     payload["reasoning_effort"], getattr(ep, "max_reasoning_effort", "")
@@ -2525,7 +2535,7 @@ class APIPool:
                     
             except urllib.error.HTTPError as e:
                 err_body = ""
-                try: err_body = e.read().decode("utf-8", errors="ignore")[:200]
+                try: err_body = e.read().decode("utf-8", errors="ignore")[:2000]
                 except Exception: pass
                 msg = f"HTTP {e.code}: {err_body}"
                 if (e.code == 400 and not force_no_retry
@@ -2534,11 +2544,17 @@ class APIPool:
                     cleaned = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
                     sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301 temperature/top_p\uff0c\u5df2\u81ea\u52a8\u79fb\u9664\u540e\u91cd\u8bd5", "WARNING")
                     return self._try_endpoint(ep, cleaned, timeout, log_usage=log_usage, force_no_retry=True)
-                if e.code == 400 and "reasoning" in err_body.lower():
+                lower_err = err_body.lower()
+                if e.code == 400 and ("reasoning" in lower_err or "effort" in lower_err):
                     downgraded = _downgrade_reasoning_payload(payload)
                     if downgraded is not None:
                         sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301\u5f53\u524d reasoning effort\uff0c\u5df2\u81ea\u52a8\u964d\u7ea7\u540e\u91cd\u8bd5", "WARNING")
                         return self._try_endpoint(ep, downgraded, timeout, log_usage=log_usage, force_no_retry=True)
+                if e.code == 400 and ("single tool-call" in lower_err or "parallel_tool_calls" in lower_err):
+                    serialized = copy.deepcopy(payload)
+                    serialized["parallel_tool_calls"] = False
+                    sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301\u5e76\u884c\u5de5\u5177\u8c03\u7528\uff0c\u5df2\u81ea\u52a8\u5173\u95ed\u540e\u91cd\u8bd5", "WARNING")
+                    return self._try_endpoint(ep, serialized, timeout, log_usage=log_usage, force_no_retry=True)
                 if e.code == 429: return None, msg + " (429 rate-limited)", meta
                 if e.code in (401, 403): return None, msg + " (auth error)", meta
                 if e.code >= 500:
