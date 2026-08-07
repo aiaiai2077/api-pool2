@@ -121,6 +121,40 @@ class TextChatMock(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
+class ReasoningCascadeMock(BaseHTTPRequestHandler):
+    calls = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.calls.append(body)
+        effort = body.get("reasoning_effort")
+        if effort in ("xhigh", "high", "medium"):
+            err = json.dumps({"error": {"message": f"invalid reasoning value: '{effort}'"}}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
+        resp = {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
+        }
+        data = json.dumps(resp).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
 class ToolChatMock(BaseHTTPRequestHandler):
     calls = []
 
@@ -538,6 +572,59 @@ def test_reasoning_xhigh_normalized_for_upstream():
     server.server_close()
 
 
+def test_reasoning_cascade_downgrade():
+    ReasoningCascadeMock.calls.clear()
+    server, port = start_server(ReasoningCascadeMock)
+    set_pool(f"http://127.0.0.1:{port}")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, body = request(base, "POST", "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "xhigh"
+    })
+    assert status == 200
+    efforts = [c.get("reasoning_effort") for c in ReasoningCascadeMock.calls]
+    assert efforts == ["high", "medium", "low"]
+
+    assert m._downgrade_reasoning_effort("max") == "high"
+    assert m._downgrade_reasoning_effort("minimal") == "low"
+    assert m._downgrade_reasoning_effort("none") is None
+    assert m._downgrade_reasoning_effort("low") is None
+    assert m._clamp_reasoning_effort("xhigh", "medium") == "medium"
+    assert m._clamp_reasoning_effort("low", "medium") == "low"
+
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
+def test_max_reasoning_effort_clamp():
+    TextChatMock.calls.clear()
+    server, port = start_server(TextChatMock)
+    set_pool(f"http://127.0.0.1:{port}")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    ep = m.pool.list_endpoints()[0]
+    m.pool.update_endpoint(ep["id"], {"max_reasoning_effort": "medium"})
+    status, _, body = request(base, "POST", "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "xhigh"
+    })
+    assert status == 200
+    sent = TextChatMock.calls[-1]
+    assert sent.get("reasoning_effort") == "medium"
+
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
 def test_openai_tool_calls():
     ToolChatMock.calls.clear()
     server, port = start_server(ToolChatMock)
@@ -826,6 +913,8 @@ def test_regression_chat_and_health_call_sites():
 def main():
     check("inbound /v1/responses over OpenAI chat upstream (text/image/reasoning/stream)", test_inbound_openai_text)
     check("reasoning effort xhigh normalized for upstream", test_reasoning_xhigh_normalized_for_upstream)
+    check("reasoning effort cascade downgrade on HTTP 400", test_reasoning_cascade_downgrade)
+    check("reasoning effort clamped by endpoint max", test_max_reasoning_effort_clamp)
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
     check("Anthropic upstream tool calls (non-stream + stream)", test_anthropic_tool_calls)
     check("native Responses upstream (inbound + chat regression)", test_native_responses_upstream)

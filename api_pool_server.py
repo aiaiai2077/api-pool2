@@ -29,6 +29,8 @@ REASONING_EFFORT_MAP = {
     "xlow": "low",
     "minimal": "low",
 }
+REASONING_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+REASONING_EFFORT_CHAIN = ["xhigh", "high", "medium", "low"]
 
 def _normalize_reasoning_effort(effort, allow_xhigh=False):
     if not isinstance(effort, str):
@@ -37,6 +39,56 @@ def _normalize_reasoning_effort(effort, allow_xhigh=False):
     if allow_xhigh and key == "xhigh":
         return effort
     return REASONING_EFFORT_MAP.get(key, effort)
+
+def _clamp_reasoning_effort(effort, max_effort):
+    if not isinstance(effort, str) or not max_effort:
+        return effort
+    key = effort.strip().lower()
+    max_key = str(max_effort).strip().lower()
+    if key not in REASONING_EFFORT_LEVELS or max_key not in REASONING_EFFORT_LEVELS:
+        return effort
+    if REASONING_EFFORT_LEVELS.index(key) > REASONING_EFFORT_LEVELS.index(max_key):
+        return max_key
+    return effort
+
+def _downgrade_reasoning_effort(effort):
+    if not isinstance(effort, str):
+        return None
+    key = effort.strip().lower()
+    if key == "max":
+        return "high"
+    if key == "minimal":
+        return "low"
+    if key == "none":
+        return None
+    if key in REASONING_EFFORT_CHAIN:
+        idx = REASONING_EFFORT_CHAIN.index(key)
+        if idx + 1 < len(REASONING_EFFORT_CHAIN):
+            return REASONING_EFFORT_CHAIN[idx + 1]
+    return None
+
+def _downgrade_reasoning_payload(payload):
+    import copy
+    p = copy.deepcopy(payload)
+    changed = False
+    if "reasoning_effort" in p:
+        new_val = _downgrade_reasoning_effort(p["reasoning_effort"])
+        if new_val is None:
+            del p["reasoning_effort"]
+        else:
+            p["reasoning_effort"] = new_val
+        changed = True
+    reasoning = p.get("reasoning")
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        new_val = _downgrade_reasoning_effort(reasoning["effort"])
+        if new_val is None:
+            del reasoning["effort"]
+            if not reasoning:
+                del p["reasoning"]
+        else:
+            reasoning["effort"] = new_val
+        changed = True
+    return p if changed else None
 
 
 class LogManager:
@@ -1346,6 +1398,7 @@ class Endpoint:
     extra_headers: dict = field(default_factory=dict)
     is_vision: bool = True
     supports_xhigh: bool = False
+    max_reasoning_effort: str = ""
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -1450,6 +1503,7 @@ class APIPool:
             "health_mode": ep.health_mode,
             "is_vision": ep.is_vision,
             "supports_xhigh": ep.supports_xhigh,
+            "max_reasoning_effort": ep.max_reasoning_effort,
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -1487,6 +1541,7 @@ class APIPool:
                     "is_rpm_limited": self._is_rpm_limited(ep),
                     "is_vision": ep.is_vision,
                     "supports_xhigh": ep.supports_xhigh,
+                    "max_reasoning_effort": ep.max_reasoning_effort,
                     "health": ep._health,
                     "health_latency_ms": ep._health_latency_ms,
                     "health_error": ep._health_error,
@@ -1842,11 +1897,17 @@ class APIPool:
                 **self.default_payload, **(extra_payload or {}),
             }
             if "reasoning_effort" in payload:
+                payload["reasoning_effort"] = _clamp_reasoning_effort(
+                    payload["reasoning_effort"], getattr(ep, "max_reasoning_effort", "")
+                )
                 payload["reasoning_effort"] = _normalize_reasoning_effort(
                     payload["reasoning_effort"], getattr(ep, "supports_xhigh", False)
                 )
             reasoning = payload.get("reasoning")
             if isinstance(reasoning, dict) and "effort" in reasoning:
+                reasoning["effort"] = _clamp_reasoning_effort(
+                    reasoning["effort"], getattr(ep, "max_reasoning_effort", "")
+                )
                 reasoning["effort"] = _normalize_reasoning_effort(
                     reasoning["effort"], getattr(ep, "supports_xhigh", False)
                 )
@@ -2473,6 +2534,11 @@ class APIPool:
                     cleaned = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
                     sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301 temperature/top_p\uff0c\u5df2\u81ea\u52a8\u79fb\u9664\u540e\u91cd\u8bd5", "WARNING")
                     return self._try_endpoint(ep, cleaned, timeout, log_usage=log_usage, force_no_retry=True)
+                if e.code == 400 and "reasoning" in err_body.lower():
+                    downgraded = _downgrade_reasoning_payload(payload)
+                    if downgraded is not None:
+                        sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301\u5f53\u524d reasoning effort\uff0c\u5df2\u81ea\u52a8\u964d\u7ea7\u540e\u91cd\u8bd5", "WARNING")
+                        return self._try_endpoint(ep, downgraded, timeout, log_usage=log_usage, force_no_retry=True)
                 if e.code == 429: return None, msg + " (429 rate-limited)", meta
                 if e.code in (401, 403): return None, msg + " (auth error)", meta
                 if e.code >= 500:
@@ -2720,6 +2786,7 @@ def api_handler(method, path, body):
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
                   "is_vision": item.get("is_vision", base.get("is_vision", True)),
                   "supports_xhigh": item.get("supports_xhigh", base.get("supports_xhigh", False)),
+                  "max_reasoning_effort": item.get("max_reasoning_effort", base.get("max_reasoning_effort", "")),
                   "enabled": item.get("enabled", True),
             }
             if ep["model"]: pool.add_endpoint(ep); added += 1
@@ -2859,7 +2926,7 @@ def _handle_responses(body):
 
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True), "supports_xhigh": ep.get("supports_xhigh", False)} for ep in pool.list_endpoints()])
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True), "supports_xhigh": ep.get("supports_xhigh", False), "max_reasoning_effort": ep.get("max_reasoning_effort", "")} for ep in pool.list_endpoints()])
 
 
 GUI_HTML = r"""<!DOCTYPE html>
@@ -3266,8 +3333,9 @@ select option { background: var(--bg); color: var(--text); }
         <label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态 (视觉) 能力</label>
         <select id="fVision"><option value="true">👁️ 原生支持</option><option value="false">🚫 不支持 (触发自动转译)</option></select>
       </div>
-    <div class="form-row">
+    <div class="form-row" style="grid-template-columns: 1fr 1fr;">
       <div class="form-group"><label title="该端点原生支持 xhigh 推理强度时开启，开启后不再把 xhigh 降级为 high">原生 xhigh 推理</label><select id="fXHigh"><option value="false">否 (自动降级)</option><option value="true">是 (原样透传)</option></select></div>
+      <div class="form-group"><label title="该端点最高支持的推理档位，超过的请求会自动降到该档；留空表示不限制">最高推理档位</label><select id="fMaxEffort"><option value="">不限</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
@@ -3363,6 +3431,7 @@ function renderEndpoints(eps){
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
     if(ep.supports_xhigh)b+=`<span class="badge" style="background:rgba(255,193,7,.15);color:#ffc107;border:1px solid rgba(255,193,7,.3)" title="原生支持 xhigh 推理强度">⚡xhigh</span>`;
+    if(ep.max_reasoning_effort)b+=`<span class="badge" style="background:rgba(0,229,255,.12);color:#00d4ff;border:1px solid rgba(0,229,255,.28)" title="该端点最高支持到该推理档位">🔒max=${ep.max_reasoning_effort}</span>`;
     if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
     else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtTime(ep.cooldown_remaining)}</span>`;
@@ -3626,7 +3695,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fVision').value='true';document.getElementById('fXHigh').value='false';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fVision').value='true';document.getElementById('fXHigh').value='false';document.getElementById('fMaxEffort').value='';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -3636,7 +3705,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fXHigh').value=String(!!ep.supports_xhigh);
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fXHigh').value=String(!!ep.supports_xhigh);document.getElementById('fMaxEffort').value=ep.max_reasoning_effort||'';
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -3645,7 +3714,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',is_vision:document.getElementById('fVision').value==='true',supports_xhigh:document.getElementById('fXHigh').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',is_vision:document.getElementById('fVision').value==='true',supports_xhigh:document.getElementById('fXHigh').value==='true',max_reasoning_effort:document.getElementById('fMaxEffort').value};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
