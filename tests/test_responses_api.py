@@ -521,6 +521,17 @@ def test_reasoning_xhigh_normalized_for_upstream():
     sent = TextChatMock.calls[-1]
     assert sent.get("reasoning_effort") == "high"
 
+    ep = m.pool.list_endpoints()[0]
+    m.pool.update_endpoint(ep["id"], {"supports_xhigh": True})
+    TextChatMock.calls.clear()
+    status, _, body = request(base, "POST", "/v1/responses", {
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "reasoning": {"effort": "xhigh"}
+    })
+    assert status == 200
+    sent = TextChatMock.calls[-1]
+    assert sent.get("reasoning_effort") == "xhigh"
+
     app_server.shutdown()
     app_server.server_close()
     server.shutdown()
