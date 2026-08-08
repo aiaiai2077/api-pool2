@@ -403,6 +403,7 @@ class ResponsesTextUpstreamMock(BaseHTTPRequestHandler):
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
+                    "reasoning_text": "thinking step",
                     "content": [{"type": "output_text", "text": "hello", "annotations": []}]
                 }],
                 "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
@@ -438,6 +439,7 @@ class ResponsesTextUpstreamMock(BaseHTTPRequestHandler):
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
+                    "reasoning_text": "thinking step",
                     "content": [{"type": "output_text", "text": "hello", "annotations": []}]
                 }],
                 "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19,
@@ -708,6 +710,78 @@ def test_empty_assistant_message_cleaned():
     roles = [m["role"] for m in TextChatMock.calls[-1]["messages"]]
     assert roles == ["user", "user"]
 
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
+def test_deepseek_reasoning_echo():
+    assert m._extract_reasoning_text({"reasoning_text": "step 1"}) == "step 1"
+    assert m._extract_reasoning_text({"reasoning_content": "step 2"}) == "step 2"
+    assert m._extract_reasoning_text({
+        "content": [{"type": "reasoning", "content": [{"type": "reasoning_text", "text": "step 3"}]}]
+    }) == "step 3"
+    text, tool_calls, rt = m._responses_output_to_chat_message([{
+        "type": "message", "role": "assistant", "reasoning_text": "deep think",
+        "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+    }])
+    assert text == "hello" and tool_calls == [] and rt == "deep think"
+
+    ResponsesTextUpstreamMock.calls.clear()
+    server, port = start_server(ResponsesTextUpstreamMock)
+    set_pool(f"http://127.0.0.1:{port}", protocol="responses", name="test_resp_up")
+    ep = m.pool.list_endpoints()[0]
+    m.pool.update_endpoint(ep["id"], {"model": "deepseek-v4-flash"})
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, _ = request(base, "POST", "/v1/responses", {
+        "input": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "prev", "annotations": []}],
+             "reasoning_text": "prev think"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+    })
+    assert status == 200
+    sent_input = ResponsesTextUpstreamMock.calls[-1]["input"]
+    assistant_item = next(i for i in sent_input
+                          if i.get("type") == "message" and i.get("role") == "assistant")
+    assert assistant_item.get("reasoning_text") == "prev think"
+
+    ResponsesTextUpstreamMock.calls.clear()
+    status, _, _ = request(base, "POST", "/v1/responses", {
+        "input": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "prev", "annotations": []}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+    })
+    assert status == 200
+    sent_input = ResponsesTextUpstreamMock.calls[-1]["input"]
+    assistant_item = next(i for i in sent_input
+                          if i.get("type") == "message" and i.get("role") == "assistant")
+    assert assistant_item.get("reasoning_text") == ""
+
+    chat_server, chat_port = start_server(TextChatMock)
+    TextChatMock.calls.clear()
+    set_pool(f"http://127.0.0.1:{chat_port}")
+    ep = m.pool.list_endpoints()[0]
+    m.pool.update_endpoint(ep["id"], {"model": "deepseek-v4-flash"})
+    status, _, _ = request(base, "POST", "/v1/chat/completions", {
+        "messages": [
+            {"role": "assistant", "content": "prev"},
+            {"role": "user", "content": "hi"}
+        ]
+    })
+    assert status == 200
+    assistant = next(mmsg for mmsg in TextChatMock.calls[-1]["messages"] if mmsg["role"] == "assistant")
+    assert assistant.get("reasoning_content") == ""
+
+    chat_server.shutdown()
+    chat_server.server_close()
     app_server.shutdown()
     app_server.server_close()
     server.shutdown()
@@ -1006,6 +1080,7 @@ def main():
     check("reasoning effort clamped by endpoint max", test_max_reasoning_effort_clamp)
     check("single tool call auto serialized on HTTP 400", test_single_tool_call_auto_serialize)
     check("empty assistant messages cleaned before forwarding", test_empty_assistant_message_cleaned)
+    check("deepseek reasoning echo preserved and backfilled", test_deepseek_reasoning_echo)
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
     check("Anthropic upstream tool calls (non-stream + stream)", test_anthropic_tool_calls)
     check("native Responses upstream (inbound + chat regression)", test_native_responses_upstream)

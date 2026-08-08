@@ -470,6 +470,34 @@ def _responses_content_text(content):
     return "\n".join(t for t in texts if t)
 
 
+def _extract_reasoning_text(item):
+    if not isinstance(item, dict):
+        return ""
+    rt = item.get("reasoning_text")
+    if not rt:
+        rt = item.get("reasoning_content")
+    if rt and isinstance(rt, str):
+        return rt.strip()
+    if rt:
+        return str(rt).strip()
+    parts = []
+    for c in item.get("content") or []:
+        if isinstance(c, dict) and c.get("type") in ("reasoning", "reasoning_text", "thinking"):
+            text = c.get("text")
+            if text:
+                parts.append(str(text).strip())
+                continue
+            nested = c.get("content")
+            if isinstance(nested, list):
+                for sub in nested:
+                    if isinstance(sub, dict):
+                        if sub.get("text"):
+                            parts.append(str(sub["text"]).strip())
+                        elif sub.get("type") == "summary_text" and sub.get("text"):
+                            parts.append(str(sub["text"]).strip())
+    return "\n".join(p for p in parts if p)
+
+
 def _responses_input_to_messages(input_data, instructions):
     messages = []
     if instructions:
@@ -521,7 +549,12 @@ def _responses_input_to_messages(input_data, instructions):
                     messages.append({"role": "system", "content": text})
             else:
                 safe_role = role if role in ("user", "assistant", "tool") else "user"
-                messages.append({"role": safe_role, "content": content or ""})
+                msg = {"role": safe_role, "content": content or ""}
+                if safe_role == "assistant":
+                    rt = _extract_reasoning_text(item)
+                    if rt or "reasoning_text" in item or "reasoning_content" in item:
+                        msg["reasoning_text"] = rt
+                messages.append(msg)
         elif item_type == "function_call":
             flush_user_parts()
             fn = item.get("function") or {}
@@ -735,6 +768,17 @@ def _chat_messages_to_responses_input(messages):
                     "role": "assistant",
                     "content": _chat_content_to_responses_content(content)
                 })
+            else:
+                items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": []
+                })
+            rt = m.get("reasoning_text")
+            if rt is None:
+                rt = m.get("reasoning_content")
+            if rt is not None and items and items[-1].get("type") == "message":
+                items[-1]["reasoning_text"] = rt
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 items.append({
@@ -816,10 +860,12 @@ def _responses_body_from_chat(payload):
 def _responses_output_to_chat_message(output):
     text = ""
     tool_calls = []
+    reasoning_text = ""
     for item in output or []:
         if not isinstance(item, dict):
             continue
         if item.get("type") == "message":
+            reasoning_text += _extract_reasoning_text(item)
             for part in item.get("content") or []:
                 if isinstance(part, dict) and part.get("type") == "output_text":
                     text += part.get("text", "")
@@ -832,7 +878,7 @@ def _responses_output_to_chat_message(output):
                     "arguments": item.get("arguments", "") or ""
                 }
             })
-    return text, tool_calls
+    return text, tool_calls, reasoning_text.strip()
 
 
 def _responses_usage_to_chat_usage(usage):
@@ -1991,6 +2037,12 @@ class APIPool:
         meta = {"usage": None, "message": None}
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         is_responses = (getattr(ep, "protocol", "openai") == "responses")
+
+        if "deepseek" in (getattr(ep, "model", "") or "").lower():
+            reasoning_field = "reasoning_text" if is_responses else "reasoning_content"
+            for m in payload.get("messages", []):
+                if m.get("role") == "assistant" and reasoning_field not in m:
+                    m[reasoning_field] = m.get("reasoning_text") or m.get("reasoning_content") or ""
         
         if is_responses:
             url = ep.base_url.rstrip("/") + "/responses"
@@ -2480,7 +2532,7 @@ class APIPool:
                         }
                         return reply.strip(), "", meta
                     elif is_responses:
-                        text, tool_calls = _responses_output_to_chat_message(body.get("output", []))
+                        text, tool_calls, reasoning_text = _responses_output_to_chat_message(body.get("output", []))
                         u = body.get("usage") or {}
                         chat_usage = _responses_usage_to_chat_usage(u)
                         if log_usage and not ep.name.startswith("test_"):
@@ -2502,7 +2554,8 @@ class APIPool:
                         meta["message"] = {
                             "role": "assistant",
                             "content": text.strip(),
-                            "tool_calls": tool_calls or None
+                            "tool_calls": tool_calls or None,
+                            "reasoning_text": reasoning_text
                         }
                         meta["usage"] = chat_usage
                         return text.strip(), "", meta
