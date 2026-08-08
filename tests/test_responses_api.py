@@ -775,6 +775,8 @@ def test_context_overflow_trimmed_and_retried():
     trimmed = ContextOverflowMock.calls[-1]["messages"]
     assert [m["role"] for m in trimmed] == ["system", "user"]
     assert trimmed[-1]["content"] == "new"
+    resp = json.loads(body)
+    assert "Context was trimmed" in resp["_api_pool_notices"][0]
 
     app_server.shutdown()
     app_server.server_close()

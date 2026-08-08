@@ -1342,6 +1342,10 @@ def _responses_stream_generator(upstream_gen, body, meta=None, model="api-pool-a
             model=model,
             output=completed_output
         )
+        if (meta or {}).get("context_trimmed"):
+            completed_response["_api_pool_notices"] = [
+                "Context was trimmed because it exceeded the upstream limit; earlier messages may be missing."
+            ]
         yield emit("response.completed", {
             "type": "response.completed",
             "response": completed_response
@@ -2660,7 +2664,16 @@ class APIPool:
                     trimmed = _trim_context_payload(payload)
                     if trimmed is not None:
                         sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0a\u4e0b\u6587\u8d85\u9650\uff0c\u5df2\u88c1\u526a\u5386\u53f2\u540e\u91cd\u8bd5", "WARNING")
-                        return self._try_endpoint(ep, trimmed, timeout, log_usage=log_usage, force_no_retry=True)
+                        trimmed_result, trimmed_err, trimmed_meta = self._try_endpoint(
+                            ep, trimmed, timeout, log_usage=log_usage, force_no_retry=True
+                        )
+                        meta["context_trimmed"] = True
+                        if trimmed_meta:
+                            if trimmed_meta.get("message"):
+                                meta["message"] = trimmed_meta["message"]
+                            if trimmed_meta.get("usage"):
+                                meta["usage"] = trimmed_meta["usage"]
+                        return trimmed_result, trimmed_err, meta
                 if e.code == 429: return None, msg + " (429 rate-limited)", meta
                 if e.code in (401, 403): return None, msg + " (auth error)", meta
                 if e.code >= 500:
@@ -2853,6 +2866,10 @@ def api_handler(method, path, body):
                     "completion_tokens_details": usage.get("completion_tokens_details") or {}
                 }
             }
+            if meta.get("context_trimmed"):
+                response["_api_pool_notices"] = [
+                    "Context was trimmed because it exceeded the upstream limit; earlier messages may be missing."
+                ]
             return 200, response, False
             
         except AllEndpointsFailed as e:
@@ -3040,6 +3057,10 @@ def _handle_responses(body):
             response_id=response_id,
             item_id=item_id
         )
+        if meta.get("context_trimmed"):
+            response_obj["_api_pool_notices"] = [
+                "Context was trimmed because it exceeded the upstream limit; earlier messages may be missing."
+            ]
         maybe_store(response_obj)
         return 200, response_obj, False
     except AllEndpointsFailed as e:
