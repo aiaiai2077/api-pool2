@@ -120,7 +120,10 @@ class LogManager:
 sys_logger = LogManager()
 def sys_log(msg, level="INFO"):
     sys_logger.log(level, msg)
-    print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}")
+    try:
+        print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}")
+    except Exception:
+        pass
 
 class TokenTracker:
     def __init__(self, db_path="token_stats.db"):
@@ -2805,6 +2808,7 @@ def api_handler(method, path, body):
         except AllEndpointsFailed as e:
             return 500, {"error": {"message": f"所有端点均已失效: {e.errors}", "type": "server_error"}}, False
         except Exception as e:
+            sys_log(f"API request exception: {e!r}", "ERROR")
             return 500, {"error": {"message": str(e), "type": "server_error"}}, False
 
     if method == "GET" and cp == "/api/logs":
@@ -2991,6 +2995,7 @@ def _handle_responses(body):
     except AllEndpointsFailed as e:
         return 500, {"error": {"message": f"所有端点均已失败: {e.errors}", "type": "server_error", "param": None, "code": None}}, False
     except Exception as e:
+        sys_log(f"Responses request exception: {e!r}", "ERROR")
         return 500, {"error": {"message": str(e), "type": "server_error", "param": None, "code": None}}, False
 
 
@@ -4275,7 +4280,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except ConnectionError:
+        except (ConnectionError, OSError):
             pass
 
     def _send_html(self, html):
@@ -4286,7 +4291,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except ConnectionError:
+        except (ConnectionError, OSError):
             pass
 
     def _read_body(self):
@@ -4311,7 +4316,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 pass
         elif self.path.startswith("/api/"):
             res = api_handler("GET", self.path, {})
@@ -4326,7 +4331,7 @@ class Handler(BaseHTTPRequestHandler):
                     for chunk in stream_gen:
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                except ConnectionError:
+                except (ConnectionError, OSError):
                     pass
             else:
                 self._send_json(res[0], res[1])
@@ -4352,7 +4357,7 @@ class Handler(BaseHTTPRequestHandler):
                 for chunk in stream_gen:
                     self.wfile.write(chunk)
                     self.wfile.flush()
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 pass
         else:
             self._send_json(res[0], res[1])
