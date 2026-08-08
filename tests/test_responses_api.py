@@ -198,6 +198,44 @@ class SingleToolCallMock(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class ContextOverflowMock(BaseHTTPRequestHandler):
+    calls = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.calls.append(body)
+        if len(self.calls) == 1:
+            err = json.dumps({
+                "error": {
+                    "message": "This model's maximum context length is 1048576 tokens. However, "
+                               "your messages resulted in 2000000 tokens. Please reduce the length."
+                }
+            }).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
+        resp = {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        }
+        data = json.dumps(resp).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
 class ToolChatMock(BaseHTTPRequestHandler):
     calls = []
 
@@ -716,6 +754,69 @@ def test_empty_assistant_message_cleaned():
     server.server_close()
 
 
+def test_context_overflow_trimmed_and_retried():
+    ContextOverflowMock.calls.clear()
+    server, port = start_server(ContextOverflowMock)
+    set_pool(f"http://127.0.0.1:{port}")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    status, _, body = request(base, "POST", "/v1/chat/completions", {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old-1"},
+            {"role": "assistant", "content": "old-2"},
+            {"role": "user", "content": "new"}
+        ]
+    })
+    assert status == 200
+    assert len(ContextOverflowMock.calls) == 2
+    trimmed = ContextOverflowMock.calls[-1]["messages"]
+    assert [m["role"] for m in trimmed] == ["system", "user"]
+    assert trimmed[-1]["content"] == "new"
+
+    app_server.shutdown()
+    app_server.server_close()
+    server.shutdown()
+    server.server_close()
+
+
+def test_trim_context_payload_helpers():
+    payload = {"messages": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "a"},
+        {"role": "user", "content": "b"},
+        {"role": "user", "content": "c"}
+    ]}
+    p = m._trim_context_payload(payload)
+    assert [x["content"] for x in p["messages"]] == ["sys", "c"]
+
+    huge = "x" * (m.CONTEXT_TRIM_CHARS + 100)
+    p = m._trim_context_payload({"messages": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": huge}
+    ]})
+    assert len(p["messages"][-1]["content"]) <= m.CONTEXT_TRIM_CHARS + 20
+    assert p["messages"][-1]["content"].endswith("x" * 100)
+
+    p = m._trim_context_payload({"messages": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "x" * (m.CONTEXT_TRIM_CHARS + 50)},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]}
+    ]})
+    parts = p["messages"][-1]["content"]
+    assert not any(x.get("type") == "image_url" for x in parts)
+    text_part = next(x for x in parts if x.get("type") == "text")
+    assert len(text_part["text"]) <= m.CONTEXT_TRIM_CHARS + 20
+
+    assert m._trim_context_payload({"messages": [
+        {"role": "user", "content": "short"}
+    ]}) is None
+
+
 def test_deepseek_reasoning_echo():
     assert m._extract_reasoning_text({"reasoning_text": "step 1"}) == "step 1"
     assert m._extract_reasoning_text({"reasoning_content": "step 2"}) == "step 2"
@@ -1080,6 +1181,8 @@ def main():
     check("reasoning effort clamped by endpoint max", test_max_reasoning_effort_clamp)
     check("single tool call auto serialized on HTTP 400", test_single_tool_call_auto_serialize)
     check("empty assistant messages cleaned before forwarding", test_empty_assistant_message_cleaned)
+    check("context overflow trimmed and retried", test_context_overflow_trimmed_and_retried)
+    check("context trim helpers", test_trim_context_payload_helpers)
     check("deepseek reasoning echo preserved and backfilled", test_deepseek_reasoning_echo)
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
     check("Anthropic upstream tool calls (non-stream + stream)", test_anthropic_tool_calls)

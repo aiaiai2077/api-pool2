@@ -92,6 +92,49 @@ def _downgrade_reasoning_payload(payload):
     return p if changed else None
 
 
+CONTEXT_TRIM_CHARS = 200000
+
+def _trim_context_payload(payload):
+    p = copy.deepcopy(payload)
+    msgs = p.get("messages", [])
+    system = [m for m in msgs if m.get("role") == "system"]
+    rest = [m for m in msgs if m.get("role") != "system"]
+    if not rest:
+        return None
+    if len(rest) > 1:
+        keep_count = max(1, len(rest) // 2)
+        p["messages"] = system + rest[-keep_count:]
+        return p
+    last = rest[-1]
+    content = last.get("content")
+    if isinstance(content, str) and len(content) > CONTEXT_TRIM_CHARS:
+        last["content"] = "...[trimmed]...\n" + content[-CONTEXT_TRIM_CHARS:]
+        p["messages"] = system + [last]
+        return p
+    if isinstance(content, list):
+        changed = False
+        new_parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                new_parts.append(part)
+                continue
+            if part.get("type") in ("image_url", "input_image"):
+                changed = True
+                continue
+            if (part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                    and len(part.get("text", "")) > CONTEXT_TRIM_CHARS):
+                part = dict(part)
+                part["text"] = "...[trimmed]...\n" + part["text"][-CONTEXT_TRIM_CHARS:]
+                changed = True
+            new_parts.append(part)
+        if changed:
+            last["content"] = new_parts
+            p["messages"] = system + [last]
+            return p
+    return None
+
+
 class LogManager:
     def __init__(self, max_history=300):
         self.history = []
@@ -2611,6 +2654,13 @@ class APIPool:
                     serialized["parallel_tool_calls"] = False
                     sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301\u5e76\u884c\u5de5\u5177\u8c03\u7528\uff0c\u5df2\u81ea\u52a8\u5173\u95ed\u540e\u91cd\u8bd5", "WARNING")
                     return self._try_endpoint(ep, serialized, timeout, log_usage=log_usage, force_no_retry=True)
+                if e.code == 400 and any(k in lower_err for k in (
+                        "context length", "context window", "context_length",
+                        "context_window", "maximum context", "exceeds limit")):
+                    trimmed = _trim_context_payload(payload)
+                    if trimmed is not None:
+                        sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0a\u4e0b\u6587\u8d85\u9650\uff0c\u5df2\u88c1\u526a\u5386\u53f2\u540e\u91cd\u8bd5", "WARNING")
+                        return self._try_endpoint(ep, trimmed, timeout, log_usage=log_usage, force_no_retry=True)
                 if e.code == 429: return None, msg + " (429 rate-limited)", meta
                 if e.code in (401, 403): return None, msg + " (auth error)", meta
                 if e.code >= 500:
