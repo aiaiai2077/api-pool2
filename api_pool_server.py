@@ -103,8 +103,21 @@ def _trim_context_payload(payload):
         return None
     if len(rest) > 1:
         keep_count = max(1, len(rest) // 2)
-        p["messages"] = system + rest[-keep_count:]
-        return p
+        kept = rest[-keep_count:]
+        # Drop orphaned tool messages whose assistant tool_calls were trimmed away
+        assistant_tool_ids = set()
+        for m in kept:
+            for tc in m.get("tool_calls") or []:
+                if tc.get("id"):
+                    assistant_tool_ids.add(tc["id"])
+        kept = [
+            m for m in kept
+            if not (m.get("role") == "tool" and m.get("tool_call_id") not in assistant_tool_ids)
+        ]
+        if kept:
+            p["messages"] = system + kept
+            return p
+        return None
     last = rest[-1]
     content = last.get("content")
     if isinstance(content, str) and len(content) > CONTEXT_TRIM_CHARS:
@@ -1506,6 +1519,7 @@ class Endpoint:
     _total_calls: int = field(default=0, repr=False)
     _total_failures: int = field(default=0, repr=False)
     _cooldown_until: float = field(default=0, repr=False)
+    _no_parallel_tools: bool = field(default=False, repr=False)
     
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
@@ -1946,8 +1960,12 @@ class APIPool:
         failed_ep._total_failures += 1
         failed_ep._last_error = error_msg
         failed_ep._last_error_ts = time.time()
-        self._set_cooldown(failed_ep)
-        sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
+        if "429" in error_msg:
+            failed_ep._cooldown_until = time.time() + 60
+            sys_log(f"端点 '{failed_ep.name}' 限流(429)，1 分钟后重试", "WARN")
+        else:
+            self._set_cooldown(failed_ep)
+            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
         active = self._active_endpoints()
         if active:
             for i, ep in enumerate(active):
@@ -2087,6 +2105,10 @@ class APIPool:
         meta = {"usage": None, "message": None}
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         is_responses = (getattr(ep, "protocol", "openai") == "responses")
+
+        if getattr(ep, "_no_parallel_tools", False) and payload.get("parallel_tool_calls", True):
+            payload = copy.deepcopy(payload)
+            payload["parallel_tool_calls"] = False
 
         if "deepseek" in (getattr(ep, "model", "") or "").lower():
             reasoning_field = "reasoning_text" if is_responses else "reasoning_content"
@@ -2654,6 +2676,7 @@ class APIPool:
                         sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301\u5f53\u524d reasoning effort\uff0c\u5df2\u81ea\u52a8\u964d\u7ea7\u540e\u91cd\u8bd5", "WARNING")
                         return self._try_endpoint(ep, downgraded, timeout, log_usage=log_usage, force_no_retry=True)
                 if e.code == 400 and ("single tool-call" in lower_err or "parallel_tool_calls" in lower_err):
+                    ep._no_parallel_tools = True
                     serialized = copy.deepcopy(payload)
                     serialized["parallel_tool_calls"] = False
                     sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301\u5e76\u884c\u5de5\u5177\u8c03\u7528\uff0c\u5df2\u81ea\u52a8\u5173\u95ed\u540e\u91cd\u8bd5", "WARNING")
