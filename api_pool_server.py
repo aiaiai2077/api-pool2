@@ -1960,12 +1960,8 @@ class APIPool:
         failed_ep._total_failures += 1
         failed_ep._last_error = error_msg
         failed_ep._last_error_ts = time.time()
-        if "429" in error_msg:
-            failed_ep._cooldown_until = time.time() + 60
-            sys_log(f"端点 '{failed_ep.name}' 限流(429)，1 分钟后重试", "WARN")
-        else:
-            self._set_cooldown(failed_ep)
-            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
+        self._set_cooldown(failed_ep)
+        sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
         active = self._active_endpoints()
         if active:
             for i, ep in enumerate(active):
