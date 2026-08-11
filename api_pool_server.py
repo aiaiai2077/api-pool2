@@ -2,7 +2,7 @@
 API Pool — 聚合 API 自动切换模块（GUI 版）
 
 启动: python api_pool_server.py
-访问: http://localhost:5100
+访问: http://localhost:14991
 """
 
 import os
